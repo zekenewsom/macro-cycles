@@ -114,34 +114,45 @@ def movers(window_days: int = 7, top_k: int = 10, pillar: str | None = None):
     mapping = load_sources_mapping()
     res = con.sql(
         """
-        WITH z AS (
-            SELECT series_id, date, z,
-                   LAG(z, 1) OVER (PARTITION BY series_id ORDER BY date) AS z_prev
+        WITH base AS (
+            SELECT series_id,
+                   date,
+                   z,
+                   COALESCE(pillar, NULL) AS pillar,
+                   COALESCE(label, series_id) AS label
             FROM read_parquet('data/indicators/*.parquet', union_by_name=true)
             WHERE date IS NOT NULL AND z IS NOT NULL AND series_id IS NOT NULL
-        ), latest AS (
+        ),
+        s AS (
+            SELECT *,
+                   LAG(z, 1) OVER (PARTITION BY series_id ORDER BY date) AS z_prev,
+                   ROW_NUMBER() OVER (PARTITION BY series_id ORDER BY date DESC) AS rn
+            FROM base
+        ),
+        last AS (
             SELECT series_id,
-                   ANY_VALUE(z) FILTER (WHERE rn=1) AS z_after,
+                   ANY_VALUE(pillar) FILTER (WHERE rn=1) AS pillar,
+                   ANY_VALUE(label)  FILTER (WHERE rn=1) AS label,
+                   ANY_VALUE(z)      FILTER (WHERE rn=1) AS z_after,
                    ANY_VALUE(z_prev) FILTER (WHERE rn=1) AS z_before
-            FROM (
-                SELECT *, ROW_NUMBER() OVER (PARTITION BY series_id ORDER BY date DESC) AS rn
-                FROM z
-            ) t
+            FROM s
             WHERE rn <= 1
             GROUP BY series_id
         )
-        SELECT series_id, COALESCE(z_after, 0.0) AS z_after,
+        SELECT series_id, pillar, label,
+               COALESCE(z_after, 0.0) AS z_after,
                COALESCE(z_after - z_before, 0.0) AS delta
-        FROM latest
+        FROM last
         ORDER BY delta DESC
         """
     ).fetchall()
-    rows = [{"id": r[0], "z_after": float(r[1]), "delta": float(r[2])} for r in res]
+    rows = [{"id": r[0], "pillar": r[1], "label": r[2], "z_after": float(r[3]), "delta": float(r[4])} for r in res]
+    # backfill labels/pillars from config mapping if missing
     for row in rows:
         info = mapping.get(row["id"], {})
-        row["label"] = info.get("name", row["id"])
-        row["pillar"] = info.get("pillar")
-        row["source"] = "FRED"
+        row["label"] = row.get("label") or info.get("name", row["id"])  # keep series_id fallback
+        row["pillar"] = row.get("pillar") or info.get("pillar")
+        row["source"] = row.get("source") or "FRED"
     # optional filter by pillar
     if pillar:
         rows = [r for r in rows if (r.get("pillar") or "").lower() == pillar.lower()]
@@ -474,6 +485,34 @@ def drivers_pillars():
     return {"pillars": pillars, "meta": meta_with_warnings(warnings=warnings)}
 
 
+@app.get("/drivers/pillar-series")
+def drivers_pillar_series(pillar: str, years: int | None = 20):
+    """Return time series of a pillar's z-score for deep dives.
+    If years is provided, tail-limit to approximately that many years (monthly data assumed).
+    """
+    warnings: List[str] = []
+    fp = os.path.join(DATA_DIR, "pillars", "pillars.parquet")
+    if not os.path.exists(fp):
+        warnings.append("Missing pillars parquet; run build_pillars.")
+        return {"pillar": pillar, "points": [], "meta": meta_with_warnings(warnings=warnings)}
+    try:
+        df = pl.read_parquet(fp).select(["date", "pillar", "z"]).drop_nulls().sort("date")
+        df = df.filter(pl.col("pillar") == pillar)
+        if df.height == 0:
+            return {"pillar": pillar, "points": [], "meta": meta_with_warnings(warnings=[f"No rows for pillar {pillar}"])}
+        if years and years > 0:
+            # approximate by last N years worth of monthly observations
+            n = df.height
+            months = years * 12
+            if n > months:
+                df = df.tail(months)
+        pts = [{"date": str(d), "z": (float(v) if v is not None else None)} for d, v in zip(df["date"], df["z"]) ]
+        return {"pillar": pillar, "points": pts, "meta": meta_with_warnings()}
+    except Exception as e:
+        warnings.append(f"pillar-series error: {type(e).__name__}")
+        return {"pillar": pillar, "points": [], "meta": meta_with_warnings(warnings=warnings)}
+
+
 @app.get("/drivers/indicator-heatmap")
 def indicator_heatmap(
     pillar: str = Query(..., description="pillar id, e.g. growth"),
@@ -533,12 +572,64 @@ def indicator_heatmap(
 
 
 @app.get("/drivers/contributions")
-def contributions():
-    fp = os.path.join(DATA_DIR, "composite", "contributions.parquet")
-    if not os.path.exists(fp):
-        return {"items": [], "meta": meta_with_warnings(warnings=["Missing contributions parquet; run build_composite."]) }
-    df = pl.read_parquet(fp).sort(pl.col("contribution").abs(), descending=True)
-    return {"items": df.to_dicts(), "meta": meta_with_warnings()}
+def contributions(horizon_months: int = 1, method: str = "weighted"):
+    """Compute contributions as weight × Δpillar over the last N months.
+    Falls back to equal weights if composite config is missing.
+    """
+    warnings: List[str] = []
+    # Load weights map
+    weights: dict[str, float] = {}
+    try:
+        with open(os.path.join("config", "composite.yaml"), "r") as f:
+            cfg = yaml.safe_load(f) or {}
+        weights = (cfg.get("pillar_weights") or {})
+        # normalize keys to str
+        weights = {str(k): float(v) for k, v in weights.items()}
+    except Exception:
+        weights = {}
+    # Load pillars parquet
+    pfp = os.path.join(DATA_DIR, "pillars", "pillars.parquet")
+    if not os.path.exists(pfp):
+        warnings.append("Missing pillars parquet; run build_pillars.")
+        return {"items": [], "meta": meta_with_warnings(warnings=warnings)}
+    df = pl.read_parquet(pfp).select(["date", "pillar", "z"]).drop_nulls().sort(["pillar", "date"])  # monthly
+    if df.is_empty():
+        return {"items": [], "meta": meta_with_warnings(warnings=["No pillar rows found"]) }
+    k = max(1, int(horizon_months))
+    # Row-based lag approximates monthly horizon
+    df = df.with_columns(
+        pl.col("z").shift(k).over("pillar").alias("z_prev")
+    ).with_columns(
+        (pl.col("z") - pl.col("z_prev")).alias("delta")
+    )
+    # pick latest per pillar
+    latest = (
+        df.group_by("pillar").agg(pl.col("date").max().alias("date"))
+        .join(df, on=["pillar", "date"], how="left")
+        .drop_nulls(subset=["z"])  # ensure current z exists
+    )
+    # Equal weight fallback
+    if not weights:
+        uniq = latest.select("pillar").unique()["pillar"].to_list()
+        if uniq:
+            w = 1.0 / len(uniq)
+            weights = {str(p): w for p in uniq}
+    # Build output
+    items: list[dict] = []
+    for r in latest.to_dicts():
+        p = str(r["pillar"]) if r.get("pillar") is not None else None
+        if not p:
+            continue
+        w = float(weights.get(p, 0.0))
+        d = float(r.get("delta") or 0.0)
+        items.append({
+            "pillar": p,
+            "weight": w,
+            "delta": d,
+            "contribution": w * d,
+        })
+    items = sorted(items, key=lambda x: abs(x.get("contribution") or 0.0), reverse=True)
+    return {"items": items, "meta": meta_with_warnings(extra={"horizon_months": k, "method": method})}
 
 @app.get("/meta/changelog")
 def changelog():
@@ -588,6 +679,41 @@ def explain_probit_effects():
         return {"items": []}
     df = pl.read_parquet(fp)
     return {"items": df.to_dicts()}
+
+
+@app.get("/risk/recession")
+def risk_recession(as_of: str | None = None):
+    """Surface recession probability from a probit model artifact if available.
+    Looks for a parquet with columns [date, prob] under data/artifacts/recession_probit.parquet.
+    If not available, returns null probability with warnings (no demo fallbacks).
+    """
+    warnings: List[str] = []
+    fp = os.path.join(ART_DIR, "recession_probit.parquet")
+    if not os.path.exists(fp):
+        warnings.append("No probit artifact found at data/artifacts/recession_probit.parquet")
+        return {"prob": None, "date": None, "meta": meta_with_warnings(warnings=warnings)}
+    try:
+        df = pl.read_parquet(fp).select([c for c in ["date", "prob", "p_recession", "probability"] if c in pl.read_parquet(fp).columns])
+        # normalize column name to prob
+        if "prob" not in df.columns:
+            for c in ["p_recession", "probability"]:
+                if c in df.columns:
+                    df = df.rename({c: "prob"})
+                    break
+        df = df.drop_nulls(subset=["date"]).sort("date")
+        if as_of:
+            try:
+                df = df.filter(pl.col("date") <= pl.lit(as_of))
+            except Exception:
+                pass
+        if df.height == 0 or "prob" not in df.columns:
+            warnings.append("Probit artifact missing required columns")
+            return {"prob": None, "date": None, "meta": meta_with_warnings(warnings=warnings)}
+        row = df.tail(1)
+        return {"prob": float(row["prob"][0]), "date": str(row["date"][0]), "meta": meta_with_warnings()}
+    except Exception as e:
+        warnings.append(f"risk error: {type(e).__name__}")
+        return {"prob": None, "date": None, "meta": meta_with_warnings(warnings=warnings)}
 
 
 @app.get("/note/monthly")
@@ -759,6 +885,50 @@ def data_series(series_id: str, include_z: bool = True, vintage: str | None = No
     label = meta_row.get_column("label").to_list()[0] if "label" in meta_row.columns and meta_row.height else series_id
     pillar = meta_row.get_column("pillar").to_list()[0] if "pillar" in meta_row.columns and meta_row.height else None
     return {"series": out, "meta": meta_with_warnings(extra={"series_id": series_id, "label": label, "pillar": pillar, "vintage": vintage})}
+
+
+@app.get("/drivers/pillar-indicator-contrib")
+def pillar_indicator_contrib(pillar: str, window: int = 1, top_k: int = 20):
+    """Per-indicator Δz for a given pillar over the past N months.
+    Scans `data/indicators/*.parquet`, filters to pillar, computes latest Δz = z - z.shift(window).
+    Returns top_k by absolute Δz.
+    """
+    base = os.path.join(DATA_DIR, "indicators")
+    if not os.path.isdir(base):
+        return {"items": [], "meta": meta_with_warnings(warnings=["No indicators directory"]) }
+    k = max(1, int(window))
+    rows: list[dict] = []
+    for fn in os.listdir(base):
+        if not fn.endswith(".parquet") or fn.startswith("_"):
+            continue
+        fp = os.path.join(base, fn)
+        try:
+            df = pl.read_parquet(fp)
+            if df.is_empty() or "pillar" not in df.columns:
+                continue
+            if pillar not in (df.get_column("pillar").unique().to_list()):
+                continue
+            cols = [c for c in ["date", "series_id", "label", "pillar", "z"] if c in df.columns]
+            d = df.select(cols).drop_nulls(subset=["date"]).sort("date")
+            if "z" not in d.columns:
+                continue
+            d = d.with_columns(pl.col("z").shift(k).alias("z_prev")).with_columns((pl.col("z") - pl.col("z_prev")).alias("delta"))
+            # latest row only
+            last = d.tail(1).to_dicts()[0] if d.height else None
+            if last:
+                rows.append({
+                    "series_id": last.get("series_id") or fn.replace(".parquet", ""),
+                    "label": last.get("label") or last.get("series_id"),
+                    "pillar": pillar,
+                    "delta": float(last.get("delta") or 0.0),
+                    "z_after": float(last.get("z") or 0.0),
+                })
+        except Exception:
+            continue
+    rows = sorted(rows, key=lambda x: abs(x.get("delta") or 0.0), reverse=True)
+    if top_k and len(rows) > top_k:
+        rows = rows[:top_k]
+    return {"items": rows, "meta": meta_with_warnings(extra={"pillar": pillar, "window": k})}
 
 
 # Markets summary / assets endpoints

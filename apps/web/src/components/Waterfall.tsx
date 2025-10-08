@@ -18,9 +18,18 @@ export default function Waterfall({ items }: { items: Item[] }) {
   async function loadMovers(p: string) {
     setLoading(true);
     try {
-      const r = await fetch(`${process.env.NEXT_PUBLIC_API_BASE}/overview/movers?top_k=15&pillar=${encodeURIComponent(p)}`, { cache: "no-store" });
+      const base = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000";
+      const r = await fetch(`${base}/overview/movers?top_k=15&pillar=${encodeURIComponent(p)}`, { cache: "no-store" });
       const j = await r.json();
-      const rows = (j?.gainers ?? []).concat(j?.losers ?? []).sort((a: any, b: any) => Math.abs(b.delta) - Math.abs(a.delta)).slice(0, 12);
+      let rows = (j?.gainers ?? []).concat(j?.losers ?? [])
+        .sort((a: any, b: any) => Math.abs(b.delta) - Math.abs(a.delta))
+        .slice(0, 12);
+      // Fallback to pillar-indicator-contrib if empty
+      if (!rows.length) {
+        const rr = await fetch(`${base}/drivers/pillar-indicator-contrib?pillar=${encodeURIComponent(p)}&window=1&top_k=12`, { cache: "no-store" });
+        const jj = await rr.json();
+        rows = (jj?.items ?? []).map((it: any) => ({ id: it.series_id, label: it.label || it.series_id, delta: it.delta, z_after: it.z_after }));
+      }
       setMovers(rows);
     } catch (e) {
       setMovers([]);
