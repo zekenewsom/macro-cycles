@@ -475,11 +475,15 @@ def drivers_pillars():
 
 
 @app.get("/drivers/indicator-heatmap")
-def indicator_heatmap(pillar: str = Query(..., description="pillar id, e.g. growth")):
+def indicator_heatmap(
+    pillar: str = Query(..., description="pillar id, e.g. growth"),
+    last_months: int = 120,
+):
     base = os.path.join(DATA_DIR, "indicators")
     if not os.path.isdir(base):
         return {"dates": [], "series": [], "matrix": [], "meta": meta_with_warnings(warnings=["No indicators found"]) }
     mats = []
+    labels_map: dict[str, str] = {}
     for fn in os.listdir(base):
         if fn.endswith(".parquet") and not fn.startswith("_"):
             df = pl.read_parquet(os.path.join(base, fn))
@@ -488,15 +492,44 @@ def indicator_heatmap(pillar: str = Query(..., description="pillar id, e.g. grow
             # Filter pillar
             if pillar not in df["pillar"].unique().to_list():
                 continue
-            mats.append(df.select(["date", "z", "series_id"]).drop_nulls())
+            # Downsample/match to monthly grid so mixed frequencies align in the heatmap
+            dsel = df.select(["date", "z", "series_id"]).drop_nulls()
+            dmon = (
+                dsel.group_by_dynamic("date", every="1mo", period="1mo", closed="left", label="right")
+                .agg([
+                    pl.col("z").last().alias("z"),
+                    pl.col("series_id").first().alias("series_id"),
+                ])
+                .drop_nulls(subset=["date"])  # ensure monthly date present
+            )
+            mats.append(dmon)
+            try:
+                sid = df.get_column("series_id").head(1).to_list()[0]
+                lab = df.get_column("label").head(1).to_list()[0] if "label" in df.columns else sid
+                labels_map[str(sid)] = str(lab)
+            except Exception:
+                pass
     if not mats:
         return {"dates": [], "series": [], "matrix": [], "meta": meta_with_warnings(warnings=[f"No indicators for pillar {pillar}"]) }
-    allz = pl.concat(mats).sort(["series_id", "date"])
+    allz = pl.concat(mats).sort(["series_id", "date"])  # long: date, z, series_id
     wide = allz.pivot(values="z", index="date", columns="series_id").sort("date")
+    if last_months and wide.height > last_months:
+        wide = wide.tail(last_months)
     dates = [str(d) for d in wide["date"].to_list()]
     series_cols = [c for c in wide.columns if c != "date"]
-    matrix = [ [ row.get(c) for c in series_cols ] for row in wide.iter_rows(named=True) ]
-    return {"dates": dates, "series": series_cols, "matrix": matrix, "meta": meta_with_warnings()}
+    # Plotly heatmap expects z rows to align with y (series), columns with x (dates)
+    matrix = []
+    for sid in series_cols:
+        col_vals = wide[sid].to_list()
+        matrix.append(col_vals)
+    series_labels = [labels_map.get(s, s) for s in series_cols]
+    return {
+        "dates": dates,
+        "series": series_cols,
+        "series_labels": series_labels,
+        "matrix": matrix,
+        "meta": meta_with_warnings(),
+    }
 
 
 @app.get("/drivers/contributions")

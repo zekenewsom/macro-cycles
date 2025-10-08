@@ -11,13 +11,25 @@ export default async function Page({ searchParams }: { searchParams: Promise<{ p
 
   const [pillarsResp, heat, contrib, snap] = await Promise.all([
     j<any>("/drivers/pillars"),
-    j<any>(`/drivers/indicator-heatmap?pillar=${pSel}`),
+    j<any>(`/drivers/indicator-heatmap?pillar=${pSel}&last_months=120`),
     j<any>("/drivers/contributions"),
     j<any>("/explain/indicator-snapshot?top_k=30"),
   ]);
 
   const heatTrace = [
-    { z: heat.matrix, x: heat.dates, y: heat.series, type: "heatmap", zsmooth: false, showscale: true },
+    {
+      z: heat.matrix,
+      x: heat.dates,
+      y: heat.series_labels ?? heat.series,
+      type: "heatmap",
+      zsmooth: false,
+      showscale: true,
+      zmin: -2.5,
+      zmax: 2.5,
+      colorscale: "RdBu",
+      reversescale: true,
+      hovertemplate: "%{y}<br>%{x}<br>z=%{z:.2f}<extra></extra>",
+    } as any,
   ];
 
   const contribTrace = [
