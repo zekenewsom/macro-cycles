@@ -36,8 +36,17 @@ def build_composite(cfg: dict):
     cols = [k for k in weights.keys() if k in wide.columns]
     if not cols:
         return ""
-    z_weighted = sum([pl.col(c) * float(weights[c]) for c in cols])
-    comp = wide.select(pl.col("date"), z_weighted.alias("z_weighted"))
+    # normalized weighted average across available (non-null) pillars per date
+    weighted_terms = [
+        pl.when(pl.col(c).is_not_null()).then(pl.col(c) * float(weights[c])).otherwise(0.0) for c in cols
+    ]
+    present_w = [pl.when(pl.col(c).is_not_null()).then(float(weights[c])).otherwise(0.0) for c in cols]
+    comp = wide.select(
+        [
+            pl.col("date"),
+            (pl.sum_horizontal(weighted_terms) / pl.sum_horizontal(present_w)).alias("z_weighted"),
+        ]
+    )
     # median z across pillars
     med = wide.select(["date"] + cols).with_columns(
         pl.concat_list([pl.col(c) for c in cols]).alias("arr")
@@ -95,24 +104,28 @@ def build_contributions(cfg: dict):
     if extras:
         print(f"[build_contributions] Warning: extra pillar_weights not in data: {', '.join(extras)}")
     wide = df.pivot(values="z", index="date", on="pillar").sort("date")
-    # 1-row delta (assumes approximately monthly data)
-    deltas = (
-        wide.select([pl.col("date")] + [(pl.col(c) - pl.col(c).shift(1)).alias(c) for c in wide.columns if c != "date"])  # type: ignore
-        .sort("date")
-    )
-    last = deltas.tail(1)
+    # per-pillar delta based on its own last two observations
     rows = []
-    if last.height:
-        last_dict = last.to_dicts()[0]
-        for k, w in weights.items():
-            if k not in last.columns:
-                continue
-            raw = last_dict.get(k, 0.0)
+    piv = df.sort(["pillar", "date"]).with_columns(
+        pl.col("z").shift(1).over("pillar").alias("z_prev"),
+        pl.max("date").over("pillar").alias("max_date"),
+    )
+    last_rows = piv.filter(pl.col("date") == pl.col("max_date"))
+    for r in last_rows.to_dicts():
+        k = r.get("pillar")
+        if k not in weights:
+            continue
+        z_last = r.get("z")
+        z_prev = r.get("z_prev")
+        if z_last is None or z_prev is None:
+            delta = 0.0
+        else:
             try:
-                delta = float(0.0 if raw is None else raw)
+                delta = float(z_last) - float(z_prev)
             except Exception:
                 delta = 0.0
-            rows.append({"pillar": k, "delta": delta, "weight": float(w), "contribution": float(w) * delta})
+        w = float(weights.get(k, 0.0))
+        rows.append({"pillar": k, "delta": delta, "weight": w, "contribution": w * delta})
     dest = os.path.join(OUT, "contributions.parquet")
     pl.DataFrame(rows).write_parquet(dest)
     return dest
