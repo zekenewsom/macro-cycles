@@ -32,7 +32,7 @@ build-pillars:
 build-composite:
 	poetry run python -m orchestration.flows.build_composite
 
-pipeline: ingest build-indicators build-pillars build-composite build-regimes explain monthly-note
+pipeline: ingest build-indicators build-pillars build-composite build-market-hmm build-regimes explain monthly-note
 
 explain:
 	poetry run python -m orchestration.flows.explainability
@@ -43,6 +43,12 @@ monthly-note:
 build-regimes:
 	poetry run python -m orchestration.flows.build_regimes
 
+# Build per-asset HMM regimes
+build-market-hmm:
+	poetry run python -m orchestration.flows.market_hmm
+
+# (HMM step is included in pipeline above)
+
 api:
 	poetry run uvicorn apps.api.main:app --reload --port 8000
 
@@ -51,3 +57,6 @@ web:
 
 alfred:
 	poetry run python -m orchestration.flows.ingest_sources ingest_alfred
+
+dq:
+	poetry run python -m orchestration.flows.dq_write

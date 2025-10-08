@@ -23,6 +23,15 @@ def build_composite(cfg: dict):
         return ""
     weights = cfg.get("pillar_weights", {})
     df = pl.read_parquet(PILLARS)
+    # validate weights cover all pillars present
+    present = set(df.select("pillar").unique()["pillar"].to_list())
+    wkeys = set(weights.keys())
+    missing = sorted(list(present - wkeys))
+    extras = sorted(list(wkeys - present))
+    if missing:
+        raise ValueError(f"Missing pillar_weights for pillars: {', '.join(missing)}")
+    if extras:
+        print(f"[build_composite] Warning: extra pillar_weights not in data: {', '.join(extras)}")
     wide = df.pivot(values="z", index="date", on="pillar").sort("date")
     cols = [k for k in weights.keys() if k in wide.columns]
     if not cols:
@@ -76,6 +85,15 @@ def build_contributions(cfg: dict):
         return ""
     weights = cfg.get("pillar_weights", {})
     df = pl.read_parquet(PILLARS)
+    # validate weights cover all pillars present
+    present = set(df.select("pillar").unique()["pillar"].to_list())
+    wkeys = set(weights.keys())
+    missing = sorted(list(present - wkeys))
+    extras = sorted(list(wkeys - present))
+    if missing:
+        raise ValueError(f"Missing pillar_weights for pillars: {', '.join(missing)}")
+    if extras:
+        print(f"[build_contributions] Warning: extra pillar_weights not in data: {', '.join(extras)}")
     wide = df.pivot(values="z", index="date", on="pillar").sort("date")
     # 1-row delta (assumes approximately monthly data)
     deltas = (

@@ -4,6 +4,7 @@ import duckdb, os, json
 import yaml
 from typing import List
 import polars as pl
+from math import isfinite
 
 app = FastAPI(title="Macro Cycles Local API", version="0.1.0")
 DB_PATH = os.getenv("DUCKDB_PATH", "db/catalog.duckdb")
@@ -108,7 +109,7 @@ def movers(window_days: int = 7, top_k: int = 10):
             SELECT series_id, date, z,
                    LAG(z, 1) OVER (PARTITION BY series_id ORDER BY date) AS z_prev
             FROM read_parquet('data/indicators/*.parquet', union_by_name=true)
-            WHERE date IS NOT NULL AND z IS NOT NULL
+            WHERE date IS NOT NULL AND z IS NOT NULL AND series_id IS NOT NULL
         ), latest AS (
             SELECT series_id,
                    ANY_VALUE(z) FILTER (WHERE rn=1) AS z_after,
@@ -187,6 +188,182 @@ def market_regimes(tickers: str = "SPX,UST2Y,UST10Y,USD,GOLD,BTC"):
             "last_updated": datetime.utcnow().isoformat(),
         })
     return {"assets": assets, "meta": meta_with_warnings(warnings=warnings)}
+
+# --- Market Regimes: history ribbons + transition matrices ---
+REG_DIR = "data/regimes"
+RAW_MKT_DIR = "data/raw/market"
+
+def _labels_from_ma_vol(df: pl.DataFrame) -> list[dict]:
+    # expects date,value; build ma50/vol20 then label per row
+    if df.is_empty():
+        return []
+    d = df.sort("date").with_columns([
+        pl.col("value").rolling_mean(window_size=50).alias("ma50"),
+        pl.col("value").pct_change().rolling_std(window_size=20).alias("vol20"),
+    ])
+    d = d.with_columns(
+        pl.when(pl.col("value") > pl.col("ma50")).then(pl.lit("Trend-Up")).otherwise(pl.lit("Trend-Down")).alias("trend")
+    )
+    # compute scalar quantiles on non-null vol20
+    dv = d.filter(pl.col("vol20").is_not_null())
+    q1 = q2 = None
+    if not dv.is_empty():
+        try:
+            q1 = dv.select(pl.col("vol20").quantile(0.33, interpolation="nearest")).item()
+            q2 = dv.select(pl.col("vol20").quantile(0.66, interpolation="nearest")).item()
+        except Exception:
+            q1 = q2 = None
+    if q1 is not None and q2 is not None:
+        d = d.with_columns(
+            pl.when(pl.col("vol20").is_not_null() & (pl.col("vol20") <= pl.lit(q1)))
+            .then(pl.lit("Low-Vol"))
+            .when(pl.col("vol20").is_not_null() & (pl.col("vol20") <= pl.lit(q2)))
+            .then(pl.lit("Mid-Vol"))
+            .otherwise(pl.lit("High-Vol"))
+            .alias("vol_bucket")
+        )
+    else:
+        d = d.with_columns(pl.lit("Mid-Vol").alias("vol_bucket"))
+    d = d.select(["date", "trend", "vol_bucket"]).drop_nulls(subset=["date", "trend"]).sort("date")
+    return [{"date": str(r["date"]), "label": f"{r['trend']} / {r['vol_bucket']}"} for r in d.to_dicts()]
+
+
+def _transition_matrix(labels: list[str]):
+    states: list[str] = []
+    for s in labels:
+        if s not in states:
+            states.append(s)
+    idx = {s: i for i, s in enumerate(states)}
+    n = len(states)
+    if n == 0:
+        return states, []
+    counts = [[0] * n for _ in range(n)]
+    for a, b in zip(labels[:-1], labels[1:]):
+        counts[idx[a]][idx[b]] += 1
+    probs = []
+    for i in range(n):
+        s = sum(counts[i]) or 1
+        probs.append([counts[i][j] / s for j in range(n)])
+    return states, probs
+
+
+def _hmm_path(ticker: str) -> str:
+    return os.path.join(REG_DIR, f"market_{ticker}_hmm.parquet")
+
+
+@app.get("/market/regimes/hmm")
+def market_regimes_hmm(tickers: str = "SPX,UST2Y,UST10Y,TWEXB,GOLD,BTC", days: int = 252 * 5):
+    items = []
+    for t in tickers.split(","):
+        sid = t.strip()
+        fp = _hmm_path(sid)
+        if not os.path.exists(fp):
+            items.append({"ticker": sid, "labels": [], "probs": []})
+            continue
+        df = pl.read_parquet(fp).sort("date")
+        if days > 0 and df.height > days:
+            df = df.tail(days)
+        labels = [{"date": str(d), "label": lab} for d, lab in zip(df["date"], df["label"])]
+        prob_cols = [c for c in df.columns if c.startswith("p")]
+        probs = []
+        for c in prob_cols:
+            probs.append({
+                "state": c,
+                "points": [{"date": str(d), "p": (float(v) if v is not None else None)} for d, v in zip(df["date"], df[c])],
+            })
+        items.append({"ticker": sid, "labels": labels, "probs": probs, "latest": labels[-1] if labels else None})
+    return {"items": items, "meta": meta_with_warnings()}
+
+
+@app.get("/market/regimes/hmm/transition-matrix")
+def market_regimes_hmm_transition_matrix(tickers: str = "SPX,UST2Y,UST10Y,TWEXB,GOLD,BTC", days: int = 252 * 2):
+    items = []
+    for t in tickers.split(","):
+        sid = t.strip()
+        fp = _hmm_path(sid)
+        if not os.path.exists(fp):
+            items.append({"ticker": sid, "states": [], "matrix": []})
+            continue
+        df = pl.read_parquet(fp).select(["date", "state"]).sort("date")
+        if days > 0 and df.height > days:
+            df = df.tail(days)
+        states = df["state"].to_list()
+        n = (max(states) + 1) if states else 0
+        counts = [[0] * n for _ in range(n)]
+        for a, b in zip(states[:-1], states[1:]):
+            counts[a][b] += 1
+        mat = []
+        for i in range(n):
+            s = sum(counts[i]) or 1
+            mat.append([counts[i][j] / s for j in range(n)])
+        items.append({"ticker": sid, "states": [f"p{idx}" for idx in range(n)], "matrix": mat})
+    return {"items": items, "meta": meta_with_warnings()}
+
+
+@app.get("/market/regimes/history")
+def market_regime_history(tickers: str = "SPX,UST2Y,UST10Y,TWEXB,GOLD,BTC", days: int = 252 * 5, mode: str = "auto"):
+    # mode: auto -> prefer hmm if exists; "hmm" -> force hmm; "heur" -> MA/vol heuristic
+    assets = []
+    for t in tickers.split(","):
+        sid = t.strip()
+        hmm_fp = _hmm_path(sid)
+        if mode in ("auto", "hmm") and os.path.exists(hmm_fp):
+            df = pl.read_parquet(hmm_fp).sort("date")
+            if days > 0 and df.height > days:
+                df = df.tail(days)
+            assets.append({"ticker": sid, "points": [{"date": str(d), "label": lab} for d, lab in zip(df["date"], df["label"]) ]})
+            continue
+        # fallback heuristic
+        path = os.path.join(RAW_MKT_DIR, f"{sid}.parquet")
+        if not os.path.exists(path):
+            assets.append({"ticker": sid, "points": []})
+            continue
+        df = pl.read_parquet(path).select(["date", "value"]).drop_nulls().sort("date")
+        if days > 0 and df.height > days:
+            df = df.tail(days)
+        labs = _labels_from_ma_vol(df)
+        assets.append({"ticker": sid, "points": labs})
+    return {"assets": assets, "meta": meta_with_warnings()}
+
+
+@app.get("/market/regimes/transition-matrix")
+def market_regime_transition_matrix(tickers: str = "SPX,UST2Y,UST10Y,TWEXB,GOLD,BTC", days: int = 252 * 2, mode: str = "auto"):
+    items = []
+    for t in tickers.split(","):
+        sid = t.strip()
+        hmm_fp = _hmm_path(sid)
+        if mode in ("auto", "hmm") and os.path.exists(hmm_fp):
+            df = pl.read_parquet(hmm_fp).select(["date", "state"]).sort("date")
+            if days > 0 and df.height > days:
+                df = df.tail(days)
+            sarr = df["state"].to_list()
+            n = (max(sarr) + 1) if sarr else 0
+            C = [[0] * n for _ in range(n)]
+            for a, b in zip(sarr[:-1], sarr[1:]):
+                C[a][b] += 1
+            P = [[(C[i][j] / (sum(C[i]) or 1)) for j in range(n)] for i in range(n)]
+            items.append({"ticker": sid, "states": [f"p{idx}" for idx in range(n)], "matrix": P})
+            continue
+        # fallback heuristic label transitions
+        path = os.path.join(RAW_MKT_DIR, f"{sid}.parquet")
+        if not os.path.exists(path):
+            items.append({"ticker": sid, "states": [], "matrix": []})
+            continue
+        df = pl.read_parquet(path).select(["date", "value"]).drop_nulls().sort("date")
+        if days > 0 and df.height > days:
+            df = df.tail(days)
+        d = df.sort("date").with_columns(pl.col("value").rolling_mean(window_size=50).alias("ma50"))
+        d = d.with_columns(pl.when(pl.col("value") > pl.col("ma50")).then(pl.lit("U")).otherwise(pl.lit("D")).alias("s"))
+        labs = d["s"].to_list()
+        states = list(dict.fromkeys(labs))
+        idx = {s: i for i, s in enumerate(states)}
+        n = len(states)
+        C = [[0] * n for _ in range(n)]
+        for a, b in zip(labs[:-1], labs[1:]):
+            C[idx[a]][idx[b]] += 1
+        P = [[(C[i][j] / (sum(C[i]) or 1)) for j in range(n)] for i in range(n)]
+        items.append({"ticker": sid, "states": states, "matrix": P})
+    return {"items": items, "meta": meta_with_warnings()}
 
 # Drivers/Data Browser endpoints
 DATA_DIR = "data"
@@ -326,25 +503,35 @@ def turning_points_track(name: str = "business"):
 @app.get("/meta/dq")
 def meta_dq():
     dq_dir = os.path.join(DATA_DIR, "_dq")
-    items = []
+    raw_docs: list[dict] = []
     warnings: List[str] = []
     if not os.path.isdir(dq_dir):
         warnings.append("DQ directory not found; run build_indicators for diagnostics")
-        return {"items": items, "meta": meta_with_warnings(warnings=warnings)}
+        return {"items": [], "meta": meta_with_warnings(warnings=warnings)}
     for fn in os.listdir(dq_dir):
         if fn.endswith(".json"):
             try:
                 with open(os.path.join(dq_dir, fn), "r") as f:
-                    items.append(json.load(f))
+                    raw_docs.append(json.load(f))
             except Exception:
                 continue
+    # flatten any {items:[...]} docs into a single flat list
+    flat_items: list[dict] = []
+    for doc in raw_docs:
+        if isinstance(doc, dict) and isinstance(doc.get("items"), list):
+            for it in doc["items"]:
+                if isinstance(it, dict):
+                    flat_items.append(it)
+        elif isinstance(doc, dict):
+            flat_items.append(doc)
     # surface warnings for stale (>45 days) or low rows
-    for it in items:
+    for it in flat_items:
+        ident = it.get("series_id") or os.path.basename(it.get("path", "?"))
         if (it.get("staleness_days") or 0) > 45:
-            warnings.append(f"{it['series_id']} stale {it['staleness_days']}d")
+            warnings.append(f"{ident} stale {it.get('staleness_days')}d")
         if (it.get("rows") or 0) < 10:
-            warnings.append(f"{it['series_id']} few rows: {it['rows']}")
-    return {"items": items, "meta": meta_with_warnings(warnings=list(set(warnings)))}
+            warnings.append(f"{ident} few rows: {it.get('rows')}")
+    return {"items": flat_items, "meta": meta_with_warnings(warnings=list(set(warnings)))}
 
 # Data Browser endpoints
 @app.get("/data/catalog")
