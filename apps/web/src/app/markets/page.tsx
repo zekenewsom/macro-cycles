@@ -2,6 +2,7 @@ import { Card } from "@/components/ui/card";
 import ChartFrame from "@/components/viz/ChartFrame";
 import { KPI } from "@/components/viz/KPI";
 import { stateColor, lineColor } from "@/lib/stateColors";
+import RegimeLegend from "@/components/RegimeLegend";
 
 export const dynamic = "force-dynamic";
 
@@ -66,6 +67,7 @@ export default async function Page(props: any) {
 
       <Card className="p-4">
         <div className="font-medium mb-2">Regime Ribbons</div>
+        <RegimeLegend />
         <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
           {tickers.map((id) => {
             const labels = hs[id]?.points ?? [];

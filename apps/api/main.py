@@ -46,27 +46,30 @@ def health():
     return {"status": "ok", "ts": datetime.utcnow().isoformat()}
 
 @app.get("/overview/composite")
-def composite(window_years: int = 40):
-    con = connect()
+def composite(window_years: int = 40, method: str = "weighted"):
     warnings: List[str] = []
-    if not (os.path.exists("data/composite") and len(os.listdir("data/composite")) > 0):
+    fp = os.path.join("data", "composite", "composite.parquet")
+    if not os.path.exists(fp):
         warnings.append("Composite parquet not found under data/composite; run build_pipeline.")
         return {"series": [], "meta": meta_with_warnings(warnings=warnings)}
-    res = con.sql(
-        """
-        SELECT 
-            date,
-            COALESCE(score, 0.0) AS score,
-            COALESCE(z, 0.0)     AS z,
-            regime,
-            COALESCE(confidence, 0.0) AS confidence
-        FROM read_parquet('data/composite/composite.parquet')
-        WHERE date >= DATE '1970-01-01' AND z IS NOT NULL
-        ORDER BY date
-        """
-    ).fetchall()
-    series = [{"date": str(r[0]), "score": float(r[1]), "z": float(r[2]),
-               "regime": r[3], "confidence": float(r[4])} for r in res]
+    df = pl.read_parquet(fp).select(["date", "score", "z", "z_median", "z_trimmed_mean", "diffusion_composite", "regime", "confidence"]).drop_nulls(subset=["date"]).sort("date")
+    col = "z"
+    m = (method or "weighted").lower()
+    if m == "median" and "z_median" in df.columns:
+        col = "z_median"
+    elif m in ("trimmed", "trimmed_mean") and "z_trimmed_mean" in df.columns:
+        col = "z_trimmed_mean"
+    elif m == "diffusion" and "diffusion_composite" in df.columns:
+        col = "diffusion_composite"
+    series = []
+    for r in df.iter_rows(named=True):
+        series.append({
+            "date": str(r["date"]),
+            "score": float(r.get("score") or 0.0),
+            "z": float(r.get(col) or 0.0),
+            "regime": r.get("regime"),
+            "confidence": float(r.get("confidence") or 0.0),
+        })
     return {"series": series, "meta": meta_with_warnings(warnings=warnings)}
 
 @app.get("/overview/pillars")
@@ -259,6 +262,53 @@ def _transition_matrix(labels: list[str]):
 def _hmm_path(ticker: str) -> str:
     return os.path.join(REG_DIR, f"market_{ticker}_hmm.parquet")
 
+def _stationary_from_matrix(mat: list[list[float]], iters: int = 500) -> list[float]:
+    try:
+        import numpy as np  # type: ignore
+        if not mat:
+            return []
+        P = np.array(mat, dtype=float)
+        n = P.shape[0]
+        pi = np.ones(n, dtype=float) / n
+        for _ in range(iters):
+            pi = pi @ P
+            s = float(pi.sum()) or 1.0
+            pi = pi / s
+        return [float(round(x, 4)) for x in pi.tolist()]
+    except Exception:
+        n = len(mat)
+        if n == 0:
+            return []
+        pi = [1.0 / n] * n
+        for _ in range(iters):
+            nxt = [0.0] * n
+            for i in range(n):
+                row = mat[i] if i < len(mat) else []
+                for j in range(n):
+                    nxt[j] += pi[i] * (row[j] if j < len(row) else 0.0)
+            s = sum(nxt) or 1.0
+            pi = [x / s for x in nxt]
+        return [round(x, 4) for x in pi]
+    
+# Backwards-compatible alias using eigenvector method if available
+def _stationary_distribution(P: list[list[float]]) -> list[float]:
+    try:
+        import numpy as np  # type: ignore
+        M = np.array(P, dtype=float)
+        if M.ndim != 2 or M.shape[0] != M.shape[1] or M.size == 0:
+            return []
+        w, v = np.linalg.eig(M.T)
+        j = int(np.argmin(np.abs(w - 1.0)))
+        vec = np.real(v[:, j])
+        vec = np.maximum(vec, 0)
+        s = float(vec.sum())
+        if s <= 0:
+            return []
+        pi = (vec / s).tolist()
+        return [float(x) for x in pi]
+    except Exception:
+        return _stationary_from_matrix(P)
+
 
 @app.get("/market/regimes/hmm", response_model=HMMResponse)
 def market_regimes_hmm(tickers: str = "SPX,UST2Y,UST10Y,TWEXB,GOLD,BTC", days: int = 252 * 5):
@@ -329,7 +379,7 @@ def market_regimes_hmm_transition_matrix(tickers: str = "SPX,UST2Y,UST10Y,TWEXB,
                     labels_map.append(f"p{i}")
         except Exception:
             labels_map = [f"p{i}" for i in range(n)]
-        items.append({"ticker": sid, "states": [f"p{idx}" for idx in range(n)], "matrix": mat, "labels": labels_map})
+        items.append({"ticker": sid, "states": [f"p{idx}" for idx in range(n)], "matrix": mat, "labels": labels_map, "stationary": _stationary_from_matrix(mat)})
     return {"items": items, "meta": meta_with_warnings()}
 
 
@@ -375,7 +425,7 @@ def market_regime_transition_matrix(tickers: str = "SPX,UST2Y,UST10Y,TWEXB,GOLD,
             for a, b in zip(sarr[:-1], sarr[1:]):
                 C[a][b] += 1
             P = [[(C[i][j] / (sum(C[i]) or 1)) for j in range(n)] for i in range(n)]
-            items.append({"ticker": sid, "states": [f"p{idx}" for idx in range(n)], "matrix": P})
+            items.append({"ticker": sid, "states": [f"p{idx}" for idx in range(n)], "matrix": P, "stationary": _stationary_from_matrix(P)})
             continue
         # fallback heuristic label transitions
         path = os.path.join(RAW_MKT_DIR, f"{sid}.parquet")
@@ -395,7 +445,7 @@ def market_regime_transition_matrix(tickers: str = "SPX,UST2Y,UST10Y,TWEXB,GOLD,
         for a, b in zip(labs[:-1], labs[1:]):
             C[idx[a]][idx[b]] += 1
         P = [[(C[i][j] / (sum(C[i]) or 1)) for j in range(n)] for i in range(n)]
-        items.append({"ticker": sid, "states": states, "matrix": P})
+        items.append({"ticker": sid, "states": states, "matrix": P, "stationary": _stationary_from_matrix(P)})
     return {"items": items, "meta": meta_with_warnings()}
 
 # Drivers/Data Browser endpoints
@@ -532,6 +582,36 @@ def turning_points_track(name: str = "business"):
         return {"labels": [{"date": str(r["date"]), "label": r["label"]} for r in rows]}
     except Exception:
         return {"labels": []}
+
+@app.get("/turning-points/spans")
+def turning_points_spans(name: str = "business"):
+    base = os.path.join("data", "regimes")
+    fp = os.path.join(base, f"{name}.parquet")
+    if not os.path.exists(fp):
+        return {"spans": []}
+    try:
+        df = pl.read_parquet(fp).select(["date", "label"]).drop_nulls().sort("date")
+        rows = df.to_dicts()
+        if not rows:
+            return {"spans": []}
+        spans = []
+        start = rows[0]["date"]
+        curr = rows[0]["label"]
+        for i in range(1, len(rows) + 1):
+            l = rows[i]["label"] if i < len(rows) else None
+            if l != curr:
+                end = rows[i - 1]["date"]
+                try:
+                    length = int((end - start).days)  # type: ignore
+                except Exception:
+                    length = None
+                spans.append({"label": curr, "start": str(start), "end": str(end), "length_days": length})
+                if i < len(rows):
+                    start = rows[i]["date"]
+                    curr = rows[i]["label"]
+        return {"spans": spans, "meta": meta_with_warnings()}
+    except Exception:
+        return {"spans": []}
 
 @app.get("/meta/dq")
 def meta_dq():
@@ -688,3 +768,22 @@ def market_assets(ids: str = "SPX,UST2Y,UST10Y,TWEXB,GOLD,BTC"):
         pts = [{"date": str(d), "value": float(v)} for d, v in zip(df["date"].to_list(), df["value"].to_list())]
         series.append({"id": sid, "points": pts})
     return {"series": series, "meta": meta_with_warnings()}
+
+
+@app.get("/market/price-series")
+def market_price_series(ticker: str, start: str | None = None, end: str | None = None, downsample: int = 1500):
+    sid = ticker.strip()
+    path = f"data/raw/market/{sid}.parquet"
+    if not os.path.exists(path):
+        return {"series": [], "meta": {"ticker": sid}}
+    df = pl.read_parquet(path).select(["date", "value"]).drop_nulls().sort("date")
+    if start:
+        df = df.filter(pl.col("date") >= pl.lit(start))
+    if end:
+        df = df.filter(pl.col("date") <= pl.lit(end))
+    n = df.height
+    if n > downsample and downsample > 0:
+        stride = max(1, n // downsample)
+        df = df.with_row_count().filter(pl.col("row_nr") % stride == 0).drop("row_nr")
+    series = [{"date": str(d), "value": float(v)} for d, v in zip(df["date"].to_list(), df["value"].to_list())]
+    return {"series": series, "meta": {"ticker": sid, "points": df.height}}

@@ -1,6 +1,7 @@
 import { Card } from "@/components/ui/card";
 import ChartFrame from "@/components/viz/ChartFrame";
 import { buildRegimeShapes } from "@/lib/regimes";
+import RegimeLegend from "@/components/RegimeLegend";
 import { j } from "@/lib/api";
 
 export const dynamic = "force-dynamic";
@@ -56,6 +57,7 @@ export default async function Page() {
           height={460}
         />
       </Card>
+      <RegimeLegend />
       <Card className="p-4">
         <div className="font-medium mb-2">Regime Spans</div>
         <div className="text-xs">

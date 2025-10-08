@@ -65,9 +65,9 @@ class TransitionMatrixItem(BaseModel):
     states: List[str]
     matrix: List[List[float]]
     labels: Optional[List[str]] = None
+    stationary: Optional[List[float]] = None
 
 
 class TransitionMatrixResponse(BaseModel):
     items: List[TransitionMatrixItem]
     meta: Meta
-

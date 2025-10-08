@@ -75,7 +75,15 @@ def _fred_fetch_all_releases(client, series_id: str) -> pd.DataFrame:
 def _yf_fetch(symbol: str) -> pd.DataFrame:
     yf = _yf_module()
     # Be explicit; avoid multi-threading quirky returns
-    return yf.download(symbol, progress=False, auto_adjust=False, actions=False, threads=False)
+    return yf.download(
+        symbol,
+        period="max",
+        interval="1d",
+        progress=False,
+        auto_adjust=False,
+        actions=False,
+        threads=False,
+    )
 
 
 def _fred_to_pl(series: pd.Series, series_id: str) -> pl.DataFrame:

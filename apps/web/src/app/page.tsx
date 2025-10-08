@@ -9,9 +9,11 @@ import Waterfall from "@/components/Waterfall";
 
 export const dynamic = "force-dynamic";
 
-export default async function Page() {
+export default async function Page(props: any) {
+  const sp = props?.searchParams && typeof props.searchParams.then === "function" ? await props.searchParams : (props?.searchParams ?? {});
+  const method = (sp?.method ?? "weighted");
   const [comp, pillars, movers, regimes, bizTrack, contrib] = await Promise.all([
-    j<CompositeResponse>("/overview/composite"),
+    j<CompositeResponse>(`/overview/composite?method=${method}`),
     j<PillarsResponse>("/overview/pillars"),
     j<MoversResponse>("/overview/movers"),
     j<MarketRegimesResp>("/market/regimes?tickers=SPX,UST2Y,UST10Y,TWEXB,GOLD,BTC"),
@@ -35,7 +37,7 @@ export default async function Page() {
       <Card>
         <ChartFrame
           title="Composite Cycle Score"
-          subtitle="with business HMM regime bands"
+          subtitle={`Method: ${method} • with business HMM regime bands`}
           traces={[{ x, y, type: "scatter", mode: "lines", name: "Composite (z)" }]}
           layout={{ shapes }}
           height={460}
