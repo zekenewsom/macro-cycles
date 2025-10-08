@@ -5,7 +5,7 @@ defaults:
 fred:
   api_key_env: FRED_API_KEY
   series:
-    - { id: ISMNO, name: ISM New Orders, freq: M, pillar: growth }
+    - { id: NAPMNOI, name: ISM New Orders Index, freq: M, pillar: growth }
     - { id: INDPRO, name: Industrial Production, freq: M, pillar: growth }
     - { id: RSAFS, name: Real Retail Sales, freq: M, pillar: growth }
     - { id: PERMIT, name: Building Permits, freq: M, pillar: housing }
@@ -15,7 +15,7 @@ fred:
     - { id: DFF, name: Fed Funds Rate, freq: D, pillar: policy }
     - { id: RRPONTSYD, name: RRP Usage, freq: D, pillar: liquidity }
     - { id: BAMLH0A0HYM2, name: HY OAS, freq: D, pillar: credit }
-    - { id: BAMLCC0A0CM, name: IG OAS, freq: D, pillar: credit }
+    - { id: BAMLC0A0CM, name: IG OAS, freq: D, pillar: credit }
     - { id: TWEXB, name: USD Broad, freq: D, pillar: external }
     - { id: DCOILWTICO, name: WTI, freq: D, pillar: external }
 

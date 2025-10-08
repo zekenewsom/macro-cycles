@@ -25,7 +25,8 @@ dependencies = [
     "fredapi (>=0.5.2,<0.6.0)",
     "hmmlearn (>=0.3.3,<0.4.0)",
     "statsmodels (>=0.14.5,<0.15.0)",
-    "scikit-learn (>=1.7.2,<2.0.0)"
+    "scikit-learn (>=1.7.2,<2.0.0)",
+    "PyYAML (>=6.0.0,<7.0.0)"
 ]
 
 
@@ -37,3 +38,11 @@ build-backend = "poetry.core.masonry.api"
 # This repository is an application (not a packaged library),
 # so disable installing the current project as a package.
 package-mode = false
+
+[tool.poetry.scripts]
+mc-ingest = "orchestration.flows.ingest_sources:main"
+mc-build-indicators = "orchestration.flows.build_indicators:build_indicators"
+mc-build-pillars = "orchestration.flows.build_pillars:run"
+mc-build-composite = "orchestration.flows.build_composite:run"
+mc-build-all = "orchestration.flows.build_pipeline:build_all"
+mc-api = "apps.api.run:main"

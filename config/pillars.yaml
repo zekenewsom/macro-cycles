@@ -1,0 +1,16 @@
+# Placeholder for pillar aggregation configuration
+# Example shape:
+# pillars:
+#   - name: growth
+#     components: [INDPRO_yoy, ISMNO_z, RSAFS_yoy]
+#   - name: inflation
+#     components: [CPILFESL_yoy, WTI_mom]
+pillars:
+  - name: growth
+  - name: labor
+  - name: inflation
+  - name: policy
+  - name: liquidity
+  - name: credit
+  - name: housing
+  - name: external

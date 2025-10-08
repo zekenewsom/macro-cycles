@@ -1,0 +1,16 @@
+# Placeholder for composite weighting configuration
+# Example shape:
+# composite:
+#   weights:
+#     growth: 0.33
+#     inflation: 0.33
+#     liquidity: 0.34
+pillar_weights:
+  growth: 0.2
+  labor: 0.1
+  inflation: 0.15
+  policy: 0.1
+  liquidity: 0.15
+  credit: 0.1
+  housing: 0.1
+  external: 0.1

@@ -1,0 +1,29 @@
+# Placeholder for indicator pipelines
+# Define per-series transforms and standardization here.
+# Example shape:
+# pipelines:
+#   - id: INDPRO_yoy
+#     source: INDPRO
+#     steps:
+#       - op: pct_change
+#         window: 12
+#       - op: zscore
+#         lookback: 120
+standardization:
+  zscore: { window_years: 10, clamp: 4.0 }
+indicators:
+  - { series_id: INDPRO,   label: Industrial Production, pillar: growth,   freq: M, pipeline: [pct_change, ema] }
+  - { series_id: RSAFS,    label: Real Retail Sales,    pillar: growth,   freq: M, pipeline: [pct_change, ema] }
+  - { series_id: PERMIT,   label: Building Permits,     pillar: housing,  freq: M, pipeline: [pct_change, ema] }
+  - { series_id: ICSA,     label: Initial Claims,       pillar: labor,    freq: W, pipeline: [pct_change, ema], invert: true }
+  - { series_id: UNRATE,   label: Unemployment Rate,    pillar: labor,    freq: M, pipeline: [diff, ema], invert: true }
+  - { series_id: CPILFESL, label: Core CPI,             pillar: inflation,freq: M, pipeline: [pct_change, ema] }
+  - { series_id: DFF,      label: Fed Funds Rate,       pillar: policy,   freq: D, pipeline: [diff, ema] }
+  - { series_id: RRPONTSYD,label: RRP Usage,            pillar: liquidity,freq: D, pipeline: [diff, ema] }
+  - { series_id: BAMLH0A0HYM2, label: HY OAS,          pillar: credit,   freq: D, pipeline: [diff, ema], invert: true }
+  - { series_id: BAMLC0A0CM,  label: IG OAS,           pillar: credit,   freq: D, pipeline: [diff, ema], invert: true }
+  - { series_id: TWEXB,    label: USD Broad,            pillar: external, freq: D, pipeline: [pct_change, ema] }
+  - { series_id: DCOILWTICO, label: WTI,               pillar: external, freq: D, pipeline: [pct_change, ema] }
+  - { series_id: SPX,      label: S&P 500,              pillar: external, freq: D, pipeline: [pct_change, ema] }
+  - { series_id: UST10Y,   label: US 10Y,               pillar: policy,   freq: D, pipeline: [pct_change, ema] }
+  - { series_id: GOLD,     label: Gold,                 pillar: external, freq: D, pipeline: [pct_change, ema] }
