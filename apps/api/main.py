@@ -5,6 +5,12 @@ import yaml
 from typing import List
 import polars as pl
 from math import isfinite
+from apps.api.models import (
+    MarketSummaryResponse,
+    RegimeHistoryResponse,
+    HMMResponse,
+    TransitionMatrixResponse,
+)
 
 app = FastAPI(title="Macro Cycles Local API", version="0.1.0")
 DB_PATH = os.getenv("DUCKDB_PATH", "db/catalog.duckdb")
@@ -96,7 +102,7 @@ def pillars():
     return {"pillars": pillars, "meta": meta_with_warnings(warnings=warnings)}
 
 @app.get("/overview/movers")
-def movers(window_days: int = 7, top_k: int = 10):
+def movers(window_days: int = 7, top_k: int = 10, pillar: str | None = None):
     warnings: List[str] = []
     if not (os.path.exists("data/indicators") and len(os.listdir("data/indicators")) > 0):
         warnings.append("Indicators parquet not found under data/indicators; run build_pipeline.")
@@ -133,6 +139,9 @@ def movers(window_days: int = 7, top_k: int = 10):
         row["label"] = info.get("name", row["id"])
         row["pillar"] = info.get("pillar")
         row["source"] = "FRED"
+    # optional filter by pillar
+    if pillar:
+        rows = [r for r in rows if (r.get("pillar") or "").lower() == pillar.lower()]
     gainers = rows[:top_k]
     losers = sorted(rows, key=lambda x: x["delta"])[:top_k]
     return {"gainers": gainers, "losers": losers, "meta": meta_with_warnings(warnings=warnings)}
@@ -251,7 +260,7 @@ def _hmm_path(ticker: str) -> str:
     return os.path.join(REG_DIR, f"market_{ticker}_hmm.parquet")
 
 
-@app.get("/market/regimes/hmm")
+@app.get("/market/regimes/hmm", response_model=HMMResponse)
 def market_regimes_hmm(tickers: str = "SPX,UST2Y,UST10Y,TWEXB,GOLD,BTC", days: int = 252 * 5):
     items = []
     for t in tickers.split(","):
@@ -264,18 +273,30 @@ def market_regimes_hmm(tickers: str = "SPX,UST2Y,UST10Y,TWEXB,GOLD,BTC", days: i
         if days > 0 and df.height > days:
             df = df.tail(days)
         labels = [{"date": str(d), "label": lab} for d, lab in zip(df["date"], df["label"])]
-        prob_cols = [c for c in df.columns if c.startswith("p")]
+        prob_cols = sorted([c for c in df.columns if c.startswith("p")])
         probs = []
         for c in prob_cols:
             probs.append({
                 "state": c,
                 "points": [{"date": str(d), "p": (float(v) if v is not None else None)} for d, v in zip(df["date"], df[c])],
             })
-        items.append({"ticker": sid, "labels": labels, "probs": probs, "latest": labels[-1] if labels else None})
+        # derive human labels per state index (mode of label by state)
+        state_labels: list[str] = []
+        try:
+            for i in range(len(prob_cols)):
+                sub = df.filter(pl.col("state") == i)
+                if sub.height:
+                    top = sub.group_by("label").count().sort("count", descending=True).head(1)["label"].to_list()[0]
+                    state_labels.append(str(top))
+                else:
+                    state_labels.append(f"p{i}")
+        except Exception:
+            state_labels = [f"p{i}" for i in range(len(prob_cols))]
+        items.append({"ticker": sid, "labels": labels, "probs": probs, "latest": labels[-1] if labels else None, "state_labels": state_labels})
     return {"items": items, "meta": meta_with_warnings()}
 
 
-@app.get("/market/regimes/hmm/transition-matrix")
+@app.get("/market/regimes/hmm/transition-matrix", response_model=TransitionMatrixResponse)
 def market_regimes_hmm_transition_matrix(tickers: str = "SPX,UST2Y,UST10Y,TWEXB,GOLD,BTC", days: int = 252 * 2):
     items = []
     for t in tickers.split(","):
@@ -296,11 +317,23 @@ def market_regimes_hmm_transition_matrix(tickers: str = "SPX,UST2Y,UST10Y,TWEXB,
         for i in range(n):
             s = sum(counts[i]) or 1
             mat.append([counts[i][j] / s for j in range(n)])
-        items.append({"ticker": sid, "states": [f"p{idx}" for idx in range(n)], "matrix": mat})
+        # derive labels per state
+        labels_map: list[str] = []
+        try:
+            for i in range(n):
+                sub = pl.read_parquet(fp).filter(pl.col("state") == i)
+                if sub.height:
+                    top = sub.group_by("label").count().sort("count", descending=True).head(1)["label"].to_list()[0]
+                    labels_map.append(str(top))
+                else:
+                    labels_map.append(f"p{i}")
+        except Exception:
+            labels_map = [f"p{i}" for i in range(n)]
+        items.append({"ticker": sid, "states": [f"p{idx}" for idx in range(n)], "matrix": mat, "labels": labels_map})
     return {"items": items, "meta": meta_with_warnings()}
 
 
-@app.get("/market/regimes/history")
+@app.get("/market/regimes/history", response_model=RegimeHistoryResponse)
 def market_regime_history(tickers: str = "SPX,UST2Y,UST10Y,TWEXB,GOLD,BTC", days: int = 252 * 5, mode: str = "auto"):
     # mode: auto -> prefer hmm if exists; "hmm" -> force hmm; "heur" -> MA/vol heuristic
     assets = []
@@ -558,6 +591,7 @@ def data_catalog():
                 label = df.get_column("label").head(1).to_list()[0] if "label" in df.columns else sid
                 pillar = df.get_column("pillar").head(1).to_list()[0] if "pillar" in df.columns else (meta.get(sid, {}).get("pillar"))
                 freq = meta.get(sid, {}).get("freq")
+                source = df.get_column("source").head(1).to_list()[0] if "source" in df.columns else None
                 # min/max date via lazy scan to avoid loading full file
                 df2 = pl.read_parquet(fp, columns=["date"], use_pyarrow=True)
                 if df2.height:
@@ -572,6 +606,7 @@ def data_catalog():
                     "label": label,
                     "pillar": pillar,
                     "freq": freq,
+                    "source": source,
                     "min_date": dmin,
                     "max_date": dmax,
                     "count": count,
@@ -614,7 +649,7 @@ def data_series(series_id: str, include_z: bool = True, vintage: str | None = No
 
 
 # Markets summary / assets endpoints
-@app.get("/market/summary")
+@app.get("/market/summary", response_model=MarketSummaryResponse)
 def market_summary(ids: str = "SPX,UST2Y,UST10Y,TWEXB,GOLD,BTC"):
     out = []
     for t in ids.split(","):

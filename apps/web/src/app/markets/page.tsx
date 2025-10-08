@@ -1,5 +1,7 @@
 import { Card } from "@/components/ui/card";
 import ChartFrame from "@/components/viz/ChartFrame";
+import { KPI } from "@/components/viz/KPI";
+import { stateColor, lineColor } from "@/lib/stateColors";
 
 export const dynamic = "force-dynamic";
 
@@ -8,16 +10,7 @@ function ribbonShapes(labels: { date: string; label: string }[], mode: "heur" | 
   if (!labels?.length) return shapes;
   let start = labels[0].date,
     curr = labels[0].label;
-  const color = (lab: string) => {
-    if (mode === "hmm") {
-      if (lab.includes("Trend-Up")) return "rgba(0,200,0,0.10)";
-      if (lab.includes("Trend-Down")) return "rgba(200,0,0,0.10)";
-      return "rgba(150,150,150,0.08)";
-    }
-    if (lab.includes("Trend-Up")) return "rgba(0,200,0,0.10)";
-    if (lab.includes("Trend-Down")) return "rgba(200,0,0,0.10)";
-    return "rgba(150,150,150,0.06)";
-  };
+  const color = (lab: string) => stateColor(lab);
   for (let i = 1; i <= labels.length; i++) {
     const l = labels[i]?.label,
       d = labels[i]?.date;
@@ -34,7 +27,8 @@ export default async function Page(props: any) {
   const sp = props?.searchParams && typeof props.searchParams.then === "function" ? await props.searchParams : (props?.searchParams ?? {});
   const ids = (sp?.tickers ?? "SPX,UST2Y,UST10Y,TWEXB,GOLD,BTC").toUpperCase();
   const mode = sp?.mode === "hmm" ? "hmm" : "auto";
-  const [hist, hmm, mats] = await Promise.all([
+  const [sum, hist, hmm, mats] = await Promise.all([
+    fetch(`${process.env.NEXT_PUBLIC_API_BASE}/market/summary?ids=${ids}`, { cache: "no-store" }).then((r) => r.json()),
     fetch(`${process.env.NEXT_PUBLIC_API_BASE}/market/regimes/history?tickers=${ids}&mode=${mode}`, { cache: "no-store" }).then((r) => r.json()),
     fetch(`${process.env.NEXT_PUBLIC_API_BASE}/market/regimes/hmm?tickers=${ids}`, { cache: "no-store" }).then((r) => r.json()),
     fetch(`${process.env.NEXT_PUBLIC_API_BASE}/market/regimes/${mode === "hmm" ? "hmm/" : ""}transition-matrix?tickers=${ids}`, { cache: "no-store" }).then((r) => r.json()),
@@ -43,11 +37,20 @@ export default async function Page(props: any) {
   const hs = Object.fromEntries((hist.assets ?? []).map((a: any) => [a.ticker, a]));
   const hinfo = Object.fromEntries((hmm.items ?? []).map((x: any) => [x.ticker, x]));
   const tm = Object.fromEntries((mats.items ?? []).map((m: any) => [m.ticker, m]));
+  const sm = Object.fromEntries((sum.items ?? []).map((i: any) => [i.id, i]));
 
   const tickers = ids.split(",");
 
   return (
     <div className="p-6 space-y-6">
+      <div className="grid grid-cols-1 md:grid-cols-3 lg:grid-cols-6 gap-4">
+        {ids.split(",").map((id: string) => {
+          const it = sm[id] || {};
+          const val = it.last != null ? it.last.toFixed(2) : "—";
+          const delta = it.ma50 != null && it.last != null ? it.last - it.ma50 : undefined;
+          return <KPI key={id} label={id === "SPX" ? "S&P 500" : id} value={String(val)} delta={delta} spark={it.spark} />;
+        })}
+      </div>
       <Card className="p-4">
         <form className="flex gap-2">
           <select name="mode" defaultValue={mode} className="bg-transparent border rounded-md px-3 py-2">
@@ -92,14 +95,22 @@ export default async function Page(props: any) {
                   <div className="p-2 text-sm">{id}: no HMM</div>
                 </Card>
               );
-              const traces = it.probs.map((s: any) => ({
-                x: s.points.map((p: any) => p.date),
-                y: s.points.map((p: any) => p.p),
-                stackgroup: "one",
-                type: "scatter",
-                mode: "lines",
-                name: s.state,
-              }));
+              const labels = (it.state_labels ?? []) as string[];
+              const traces = it.probs.map((s: any) => {
+                const idx = Number(String(s.state).replace("p", ""));
+                const name = labels[idx] || s.state;
+                const color = lineColor(name);
+                return {
+                  x: s.points.map((p: any) => p.date),
+                  y: s.points.map((p: any) => p.p),
+                  stackgroup: "one",
+                  type: "scatter",
+                  mode: "lines",
+                  name,
+                  line: { color },
+                  fillcolor: stateColor(name),
+                } as any;
+              });
               return (
                 <Card key={id} className="p-2">
                   <ChartFrame title={`${id} — P(states)`} traces={traces as any} height={200} />
@@ -115,13 +126,12 @@ export default async function Page(props: any) {
         <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
           {tickers.map((id) => {
             const m = tm[id];
+            const labels = m?.labels ?? m?.states ?? [];
             return (
               <ChartFrame
                 key={id}
                 title={id}
-                traces={[
-                  { z: m?.matrix ?? [], x: m?.states ?? [], y: m?.states ?? [], type: "heatmap", hovertemplate: "%{y}→%{x}: %{z:.2f}<extra></extra>" } as any,
-                ]}
+                traces={[{ z: m?.matrix ?? [], x: labels, y: labels, type: "heatmap", hovertemplate: "%{y}→%{x}: %{z:.2f}<extra></extra>" } as any]}
                 height={320}
               />
             );
