@@ -1,0 +1,30 @@
+defaults:
+  retry: { max_attempts: 3, backoff_seconds: 2 }
+  cache: { parquet_root: "data/raw", index_db: "db/catalog.duckdb" }
+
+fred:
+  api_key_env: FRED_API_KEY
+  series:
+    - { id: ISMNO, name: ISM New Orders, freq: M, pillar: growth }
+    - { id: INDPRO, name: Industrial Production, freq: M, pillar: growth }
+    - { id: RSAFS, name: Real Retail Sales, freq: M, pillar: growth }
+    - { id: PERMIT, name: Building Permits, freq: M, pillar: housing }
+    - { id: ICSA, name: Initial Claims, freq: W, pillar: labor }
+    - { id: UNRATE, name: Unemployment Rate, freq: M, pillar: labor }
+    - { id: CPILFESL, name: Core CPI, freq: M, pillar: inflation }
+    - { id: DFF, name: Fed Funds Rate, freq: D, pillar: policy }
+    - { id: RRPONTSYD, name: RRP Usage, freq: D, pillar: liquidity }
+    - { id: BAMLH0A0HYM2, name: HY OAS, freq: D, pillar: credit }
+    - { id: BAMLCC0A0CM, name: IG OAS, freq: D, pillar: credit }
+    - { id: TWEXB, name: USD Broad, freq: D, pillar: external }
+    - { id: DCOILWTICO, name: WTI, freq: D, pillar: external }
+
+yfinance:
+  tickers:
+    - { symbol: ^GSPC, alias: SPX }
+    - { symbol: ^TNX, alias: UST10Y }
+    - { symbol: GC=F, alias: GOLD }
+
+coingecko:
+  assets:
+    - { id: bitcoin, alias: BTC }

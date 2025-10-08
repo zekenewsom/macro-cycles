@@ -1,0 +1,11 @@
+# node / python
+node_modules
+.next
+.env
+__pycache__/
+*.pyc
+.venv
+dist
+# data
+data/
+db/catalog.duckdb
