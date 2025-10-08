@@ -11,6 +11,8 @@ const items = [
   { href: "/", label: "Overview" },
   { href: "/drivers", label: "Drivers" },
   { href: "/explain", label: "Explain" },
+  { href: "/markets", label: "Markets" },
+  { href: "/turning-points", label: "Turning Points" },
   { href: "/data", label: "Data" },
   { href: "/note", label: "Monthly Note" },
 ];

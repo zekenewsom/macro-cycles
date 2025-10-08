@@ -5,16 +5,18 @@ import { Card } from "@/components/ui/card";
 import Link from "next/link";
 import { j } from "@/lib/api";
 import type { CompositeResponse, PillarsResponse, MoversResponse, MarketRegimesResp } from "@/lib/types";
+import Waterfall from "@/components/Waterfall";
 
 export const dynamic = "force-dynamic";
 
 export default async function Page() {
-  const [comp, pillars, movers, regimes, bizTrack] = await Promise.all([
+  const [comp, pillars, movers, regimes, bizTrack, contrib] = await Promise.all([
     j<CompositeResponse>("/overview/composite"),
     j<PillarsResponse>("/overview/pillars"),
     j<MoversResponse>("/overview/movers"),
     j<MarketRegimesResp>("/market/regimes?tickers=SPX,UST2Y,UST10Y,TWEXB,GOLD,BTC"),
     j<any>("/turning-points/track?name=business"),
+    j<any>("/drivers/contributions"),
   ]);
 
   const x = comp.series.map((d) => d.date);
@@ -70,6 +72,11 @@ export default async function Page() {
         <div className="text-xs overflow-auto">
           <pre>{JSON.stringify(movers, null, 2)}</pre>
         </div>
+      </Card>
+
+      <Card className="p-4">
+        <div className="font-medium mb-2">What Changed — Composite Contributions</div>
+        <Waterfall items={contrib.items ?? []} />
       </Card>
     </div>
   );

@@ -3,6 +3,7 @@ import { Geist, Geist_Mono } from "next/font/google";
 import "./globals.css";
 import CommandPalette from "@/components/CommandPalette";
 import NavBar from "@/components/NavBar";
+import MetaStrip from "@/components/MetaStrip";
 
 const geistSans = Geist({
   variable: "--font-geist-sans",
@@ -29,6 +30,7 @@ export default function RootLayout({
       <body className={`${geistSans.variable} ${geistMono.variable} antialiased`}>
         <CommandPalette />
         <NavBar />
+        <MetaStrip />
         {children}
       </body>
     </html>

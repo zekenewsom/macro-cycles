@@ -2,7 +2,8 @@ import os
 import polars as pl
 from prefect import flow, task
 
-from libs.py.indicators import load_indicator_configs, apply_pipeline, rolling_z
+from libs.py.indicators import load_indicator_configs, apply_pipeline, rolling_z, canonicalize_freq
+import json, datetime
 
 RAW = "data/raw"
 OUT = "data/indicators"
@@ -32,10 +33,17 @@ def build_one(ind_def: dict, zcfg: dict):
             break
     if not fp:
         return None
-    df = pl.read_parquet(fp)
+    raw = pl.read_parquet(fp)
+    # DQ: percent NaN before dropping
+    total_rows = int(raw.height)
+    nan_rows = int(raw.filter(pl.col("value").is_null()).height) if total_rows else 0
+    df = raw
     if not set(["date", "value"]).issubset(df.columns):
         return None
     df = df.select(["date", "value"]).drop_nulls().sort("date")
+    # canonicalize frequency
+    target_freq = ind_def.get("freq", "M")
+    df = canonicalize_freq(df, target_freq)
     transforms = ind_def.get("pipeline", [])
     inv = ind_def.get("invert", False)
     if transforms:
@@ -57,7 +65,29 @@ def build_one(ind_def: dict, zcfg: dict):
             pl.lit(ind_def.get("pillar")).alias("pillar"),
         ]
     )
-    out.write_parquet(os.path.join(OUT, f"{sid}.parquet"))
+    out_fp = os.path.join(OUT, f"{sid}.parquet")
+    out.write_parquet(out_fp)
+    # DQ gate: write JSON with counts and staleness
+    try:
+        dq_dir = os.path.join("data", "_dq")
+        os.makedirs(dq_dir, exist_ok=True)
+        last_date = out.select(pl.col("date").max()).item() if out.height else None
+        staleness = None
+        if last_date is not None:
+            staleness = (datetime.date.today() - last_date.date()).days if hasattr(last_date, "date") else None
+        dq = {
+            "series_id": sid,
+            "rows": int(out.height),
+            "last_date": str(last_date) if last_date is not None else None,
+            "staleness_days": staleness,
+            "path": out_fp,
+            "rows_raw": total_rows,
+            "pct_nan_raw": (nan_rows / total_rows) if total_rows else 0.0,
+        }
+        with open(os.path.join(dq_dir, f"{sid}.json"), "w") as f:
+            json.dump(dq, f)
+    except Exception:
+        pass
     return sid
 
 
@@ -77,4 +107,3 @@ def build_indicators():
 
 if __name__ == "__main__":
     build_indicators()
-

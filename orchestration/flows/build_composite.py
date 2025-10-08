@@ -27,7 +27,32 @@ def build_composite(cfg: dict):
     cols = [k for k in weights.keys() if k in wide.columns]
     if not cols:
         return ""
-    comp = wide.select(pl.col("date"), sum([pl.col(c) * float(weights[c]) for c in cols]).alias("z"))
+    z_weighted = sum([pl.col(c) * float(weights[c]) for c in cols])
+    comp = wide.select(pl.col("date"), z_weighted.alias("z_weighted"))
+    # median z across pillars
+    med = wide.select(["date"] + cols).with_columns(
+        pl.concat_list([pl.col(c) for c in cols]).alias("arr")
+    ).select(["date", pl.col("arr").list.median().alias("z_median")])
+    comp = comp.join(med, on="date", how="left")
+    # trimmed mean (drop top/bottom 1 value if >=3 pillars)
+    tmean = wide.select(["date"] + cols).with_columns(
+        pl.concat_list([pl.col(c) for c in cols]).alias("arr")
+    ).select([
+        "date",
+        pl.when(pl.col("arr").list.len() >= 3)
+        .then(pl.col("arr").list.sort().list.slice(1, pl.len() - 2).list.mean())
+        .otherwise(pl.col("arr").list.mean())
+        .alias("z_trimmed_mean"),
+    ])
+    comp = comp.join(tmean, on="date", how="left")
+    # diffusion-only composite from pillars diffusion
+    pil = pl.read_parquet(PILLARS).select(["date", "pillar", "diffusion"]).pivot(values="diffusion", index="date", on="pillar")
+    dcols = [c for c in pil.columns if c != "date"]
+    diffc = pil.select(["date", (sum([pl.col(c) for c in dcols]) / pl.lit(len(dcols))).alias("diffusion_composite")])
+    comp = comp.join(diffc, on="date", how="left")
+    # primary z as weighted
+    comp = comp.with_columns([pl.col("z_weighted").alias("z")])
+    # add regime/confidence/score based on z
     comp = comp.with_columns([
         pl.when(pl.col("z") > 0.75)
         .then(pl.lit("Expansion"))

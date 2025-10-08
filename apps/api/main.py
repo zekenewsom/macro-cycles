@@ -322,3 +322,147 @@ def turning_points_track(name: str = "business"):
         return {"labels": [{"date": str(r["date"]), "label": r["label"]} for r in rows]}
     except Exception:
         return {"labels": []}
+
+@app.get("/meta/dq")
+def meta_dq():
+    dq_dir = os.path.join(DATA_DIR, "_dq")
+    items = []
+    warnings: List[str] = []
+    if not os.path.isdir(dq_dir):
+        warnings.append("DQ directory not found; run build_indicators for diagnostics")
+        return {"items": items, "meta": meta_with_warnings(warnings=warnings)}
+    for fn in os.listdir(dq_dir):
+        if fn.endswith(".json"):
+            try:
+                with open(os.path.join(dq_dir, fn), "r") as f:
+                    items.append(json.load(f))
+            except Exception:
+                continue
+    # surface warnings for stale (>45 days) or low rows
+    for it in items:
+        if (it.get("staleness_days") or 0) > 45:
+            warnings.append(f"{it['series_id']} stale {it['staleness_days']}d")
+        if (it.get("rows") or 0) < 10:
+            warnings.append(f"{it['series_id']} few rows: {it['rows']}")
+    return {"items": items, "meta": meta_with_warnings(warnings=list(set(warnings)))}
+
+# Data Browser endpoints
+@app.get("/data/catalog")
+def data_catalog():
+    base = os.path.join(DATA_DIR, "indicators")
+    cfg_fp = os.path.join("config", "indicators.yaml")
+    if not os.path.isdir(base):
+        return {"items": []}
+    # load config mapping for freq, label, pillar
+    try:
+        with open(cfg_fp, "r") as f:
+            cfg = yaml.safe_load(f) or {}
+        ind = cfg.get("indicators", []) or []
+    except Exception:
+        ind = []
+    meta = {i.get("series_id"): i for i in ind}
+    items = []
+    for fn in os.listdir(base):
+        if fn.endswith(".parquet") and not fn.startswith("_"):
+            fp = os.path.join(base, fn)
+            try:
+                df = pl.read_parquet(fp, n_rows=5)
+                sid = df.get_column("series_id").head(1).to_list()[0] if "series_id" in df.columns else fn.replace(".parquet", "")
+                label = df.get_column("label").head(1).to_list()[0] if "label" in df.columns else sid
+                pillar = df.get_column("pillar").head(1).to_list()[0] if "pillar" in df.columns else (meta.get(sid, {}).get("pillar"))
+                freq = meta.get(sid, {}).get("freq")
+                # min/max date via lazy scan to avoid loading full file
+                df2 = pl.read_parquet(fp, columns=["date"], use_pyarrow=True)
+                if df2.height:
+                    dmin = str(df2.get_column("date").min())
+                    dmax = str(df2.get_column("date").max())
+                    count = int(df2.height)
+                else:
+                    dmin = dmax = None
+                    count = 0
+                items.append({
+                    "series_id": sid,
+                    "label": label,
+                    "pillar": pillar,
+                    "freq": freq,
+                    "min_date": dmin,
+                    "max_date": dmax,
+                    "count": count,
+                    "path": fp,
+                })
+            except Exception:
+                continue
+    return {"items": items, "meta": meta_with_warnings()}
+
+
+@app.get("/data/series")
+def data_series(series_id: str, include_z: bool = True, vintage: str | None = None):
+    base = os.path.join(DATA_DIR, "indicators")
+    path = os.path.join(base, f"{series_id}.parquet")
+    if not os.path.exists(path):
+        return {"series": [], "meta": meta_with_warnings(warnings=[f"No indicators parquet for {series_id}"])}
+    df = pl.read_parquet(path)
+    cols = ["date", "value"] + (["z"] if include_z and "z" in df.columns and not vintage else [])
+    df = df.select([c for c in cols if c in df.columns]).sort("date")
+    # Optional vintage-as-of selection (using ALFRED vintages if available)
+    if vintage:
+        try:
+            vdt = pl.datetime.strptime(vintage, "%Y-%m-%d")
+        except Exception:
+            vdt = None
+        vint_path = os.path.join(DATA_DIR, "vintage", "fred", f"{series_id}.parquet")
+        if vdt and os.path.exists(vint_path):
+            vint = pl.read_parquet(vint_path).select(["date", "value", "vintage"]).filter(pl.col("vintage") <= vdt).sort(["date", "vintage"])  # type: ignore
+            vint_asof = vint.group_by("date").agg(pl.col("value").last()).rename({"value": "value_vint"})
+            df = df.join(vint_asof, on="date", how="left").with_columns(pl.coalesce([pl.col("value_vint"), pl.col("value")]).alias("value")).drop("value_vint")
+            # If vintage-as-of is used, z from latest is not appropriate; omit z
+            if "z" in df.columns:
+                df = df.drop("z")
+    out = [{"date": str(r[0]), "value": (float(r[1]) if r[1] is not None else None), **({"z": (float(r[2]) if len(r) > 2 and r[2] is not None else None)} if len(cols) > 2 else {})} for r in df.iter_rows()]
+    # attach basic metadata
+    meta_row = pl.read_parquet(path, n_rows=1)
+    label = meta_row.get_column("label").to_list()[0] if "label" in meta_row.columns and meta_row.height else series_id
+    pillar = meta_row.get_column("pillar").to_list()[0] if "pillar" in meta_row.columns and meta_row.height else None
+    return {"series": out, "meta": meta_with_warnings(extra={"series_id": series_id, "label": label, "pillar": pillar, "vintage": vintage})}
+
+
+# Markets summary / assets endpoints
+@app.get("/market/summary")
+def market_summary(ids: str = "SPX,UST2Y,UST10Y,TWEXB,GOLD,BTC"):
+    out = []
+    for t in ids.split(","):
+        sid = t.strip()
+        path = f"data/raw/market/{sid}.parquet"
+        if not os.path.exists(path):
+            out.append({"id": sid, "warning": "missing"})
+            continue
+        df = pl.read_parquet(path).select(["date", "value"]).drop_nulls().sort("date")
+        if df.height == 0:
+            out.append({"id": sid, "warning": "empty"})
+            continue
+        last = float(df.tail(1)["value"][0])
+        # simple sparkline last 30 values
+        spark = [float(v) for v in df.tail(30)["value"].to_list()]
+        # 50-day moving average and 20-day vol proxy if daily
+        ma = None
+        try:
+            ma = float(df.tail(50)["value"].mean()) if df.height >= 50 else None
+        except Exception:
+            ma = None
+        out.append({"id": sid, "last": last, "ma50": ma, "spark": spark})
+    return {"items": out, "meta": meta_with_warnings()}
+
+
+@app.get("/market/assets")
+def market_assets(ids: str = "SPX,UST2Y,UST10Y,TWEXB,GOLD,BTC"):
+    series = []
+    for t in ids.split(","):
+        sid = t.strip()
+        path = f"data/raw/market/{sid}.parquet"
+        if not os.path.exists(path):
+            series.append({"id": sid, "points": []})
+            continue
+        df = pl.read_parquet(path).select(["date", "value"]).drop_nulls().sort("date")
+        pts = [{"date": str(d), "value": float(v)} for d, v in zip(df["date"].to_list(), df["value"].to_list())]
+        series.append({"id": sid, "points": pts})
+    return {"series": series, "meta": meta_with_warnings()}

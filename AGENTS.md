@@ -1,36 +1,57 @@
-# Repository Guidelines
+# Macro Cycles — Agent Plan & Progress
+
+This file tracks scope, plan, progress, and how to run things during development.
 
 ## Project Structure
 - `apps/api`: FastAPI service (`apps/api/main.py`).
 - `apps/web`: Next.js App Router UI (Tailwind + shadcn/ui + Plotly).
-- `orchestration/flows`: Prefect flows for ingest/build (`ingest_sources.py`, `build_indicators.py`, `build_pillars.py`, `build_composite.py`).
-- `libs/py`: Shared Python utilities (e.g., `indicators.py`).
-- `config/*.yaml`: Source list, indicator pipelines, pillar weights.
-- `data/`: Parquet lake (`raw/`, `indicators/`, `pillars/`, `composite/`).
+- `orchestration/flows`: Prefect flows (ingest/build/explain/regimes/note).
+- `libs/py`: Shared Python utilities and transforms.
+- `config/*.yaml`: Sources, indicator pipelines, pillar weights.
+- `data/`: Parquet lake (raw, indicators, pillars, composite, regimes, artifacts, vintages).
 - `db/`: DuckDB catalog (local only).
 
-## Build & Dev Commands
-- Prereqs: Python 3.12, Poetry, Node 18+.
-- Install: `make install` (Poetry + web dependencies).
-- Pipeline (local-only): `make pipeline` → ingest (FRED/yf) → indicators → pillars → composite.
-- API (reload): `make api` → http://127.0.0.1:8000
-- Web (Next.js): `make web` → http://localhost:3000
-- Key endpoints: `/overview/{composite,pillars,movers,market/regimes}`, `/drivers/{pillars,indicator-heatmap,contributions}`.
+## Current Status (2025‑10‑08)
+Delivered
+- Explainability: indicator snapshot, pillar contribution TS, probit placeholder; endpoints + UI page.
+- Monthly Note: generated markdown with composite, regimes, movers, breaks.
+- Data endpoints: `/data/catalog`, `/data/series` (supports `vintage=YYYY-MM-DD`).
+- Market endpoints: `/market/summary` (KPIs + sparkline), `/market/assets` (TS).
+- Regimes flow: HMM over composite + per‑pillar → `data/regimes/` and `/turning-points/track` endpoint.
+- Composite variants: weighted z (primary), median, trimmed mean, diffusion composite.
+- Indicator robustness: frequency canonicalization (M/W/D), DQ gates (`data/_dq/*.json`, `/meta/dq`).
+- Web pages: Overview (waterfall), Drivers, Explain, Markets, Turning Points, Data, Monthly Note.
+- Global UI: centered navbar (mobile sheet), ⌘K palette, meta strip (data vintage + warnings).
 
-## Coding Style & Conventions
-- Python: PEP8, 4 spaces, `snake_case` modules, `PascalCase` classes, typed where useful.
-- Keep endpoints thin; prefer pure functions/utilities in `libs/py`.
-- YAML configs drive pipelines; avoid hard-coding series lists in code.
+In progress / Next
+- ALFRED vintages (flow exists; needs backtest UI options).
+- New free sources: BEA, BLS, H.4.1, Treasury, CoinGecko adapters.
+- Recession probit (proper fit + coefficients + marginal effects artifact).
+- Market regimes: MA/vol/HMM hybrids + transitions.
+- Data Browser filters and drill (pillar/freq/source/tags; right metadata pane).
+- Pydantic response models; time‑frame toggle for waterfall; toasts for `meta.warnings`.
+- Tests (contract/transform/DQ) and README troubleshooting.
 
-## Data & Safety
-- No demo fallbacks. If data is missing, endpoints return empty arrays with `meta.warnings`.
-- Secrets: copy `.env.example` → `.env`; set `FRED_API_KEY`. Do not commit secrets.
-- Parquet under `data/` is disposable; regenerate via `make pipeline`.
+## How to Run
+- Install: `make install` (Python 3.12, Poetry, Node 18+)
+- Pipeline: `make pipeline` (ingest → indicators → pillars → composite → regimes → explain → note)
+- Vintage (optional): `make alfred`
+- API: `make api` → http://127.0.0.1:8000
+- Web: `make web` → http://localhost:3000
 
-## Testing & Verification
-- Smoke checks: `curl /health`, `/overview/*`, and `/drivers/*` while API runs.
-- Python tests (optional): place `tests/test_*.py`; run `poetry run pytest -q`.
+## Notable Endpoints
+- Overview: `/overview/{composite,pillars,movers}`, `/market/regimes`
+- Explain: `/explain/{indicator-snapshot,pillar-contrib-timeseries,probit-effects}`
+- Note: `/note/monthly`
+- Turning points: `/turning-points/track?name=business`
+- Data: `/data/{catalog,series?series_id=…&vintage=YYYY-MM-DD}`
+- Markets: `/market/{summary,assets?ids=…}`
+- Meta: `/meta/dq`
 
-## Commits & PRs
-- Conventional Commits (e.g., `feat(api): drivers heatmap` / `fix(flow): null-safe contributions`).
-- PRs include: scope, run steps (Makefile targets), screenshots (web) or sample JSON (API), and config changes.
+## Coding Conventions
+- Python: PEP8, typed where useful, thin endpoints; push logic into `libs/py`.
+- YAML configs drive pipelines; avoid hardcoded lists in code.
+- No demo fallbacks — return empty arrays + `meta.warnings`.
+
+## PRs & Commits
+- Conventional Commits; include scope, Makefile steps, screenshots (web) or sample JSON (API), and config changes.

@@ -7,6 +7,7 @@ import pandas as pd
 from prefect import flow, task, get_run_logger
 from tenacity import retry, stop_after_attempt, wait_fixed
 from dotenv import load_dotenv
+import requests
 
 from libs.py.config_loader import load_sources_config, get_retry_config, get_cache_config
 
@@ -42,14 +43,33 @@ def _fred_client(api_key_env: str):
         raise RuntimeError(f"Missing {api_key_env} in environment")
     return Fred(api_key=key)
 
+def _fred_client_vintage(api_key_env: str):
+    # Same client; we'll use fredapi's all releases endpoint
+    from fredapi import Fred
+    key = os.getenv(api_key_env)
+    if not key:
+        raise RuntimeError(f"Missing {api_key_env} in environment")
+    return Fred(api_key=key)
+
 
 def _yf_module():
     import yfinance as yf
     return yf
 
+def _cg_prices(asset_id: str):
+    url = f"https://api.coingecko.com/api/v3/coins/{asset_id}/market_chart"
+    params = {"vs_currency": "usd", "days": "max"}
+    r = requests.get(url, params=params, timeout=30)
+    r.raise_for_status()
+    return r.json().get("prices", [])
+
 
 def _fred_fetch_series(client, series_id: str) -> pd.Series:
     return client.get_series(series_id)
+
+def _fred_fetch_all_releases(client, series_id: str) -> pd.DataFrame:
+    # Returns df with columns: date, value, realtime_start, realtime_end
+    return client.get_series_all_releases(series_id)
 
 
 def _yf_fetch(symbol: str) -> pd.DataFrame:
@@ -137,6 +157,45 @@ def ingest_fred_series(series: Dict[str, Any], cache: Dict[str, Any], retry_cfg:
 
 
 @task
+def ingest_alfred_series(series: Dict[str, Any], cache: Dict[str, Any], retry_cfg: Dict[str, Any]):
+    """Fetch all vintages for a FRED series and write data/vintage/fred/<id>.parquet
+    Columns: date, value, vintage
+    """
+    logger = get_run_logger()
+    parquet_root = cache.get("parquet_root", "data/raw")
+    api_key_env = series.get("api_key_env") or "FRED_API_KEY"
+    client = _fred_client_vintage(api_key_env)
+    series_id = series["id"]
+
+    @_retry_decorator(retry_cfg)
+    def _fetch():
+        return _fred_fetch_all_releases(client, series_id)
+
+    try:
+        df = _fetch()
+    except Exception as e:
+        logger.warning(f"Skipping ALFRED series {series_id}: {e}")
+        return ""
+    if df is None or df.empty:
+        logger.warning(f"No vintage data for {series_id}")
+        return ""
+    # Normalize columns
+    pdf = pd.DataFrame({
+        "date": pd.to_datetime(df["date"]).dt.tz_localize(None),
+        "value": pd.to_numeric(df["value"], errors="coerce"),
+        "vintage": pd.to_datetime(df["realtime_start"]).dt.tz_localize(None),
+        "series_id": series_id,
+        "source": "alfred",
+        "retrieved_at": _now_iso(),
+    })
+    pl_df = pl.from_pandas(pdf).select(["date", "value", "vintage"]).drop_nulls(subset=["date", "vintage"]).sort(["date", "vintage"])  # type: ignore
+    out_path = os.path.join("data", "vintage", "fred", f"{series_id}.parquet")
+    _write_parquet(pl_df, out_path)
+    logger.info(f"Wrote ALFRED vintages {series_id} -> {out_path}")
+    return out_path
+
+
+@task
 def ingest_yf_ticker(item: Dict[str, Any], cache: Dict[str, Any], retry_cfg: Dict[str, Any]):
     logger = get_run_logger()
     parquet_root = cache.get("parquet_root", "data/raw")
@@ -156,6 +215,35 @@ def ingest_yf_ticker(item: Dict[str, Any], cache: Dict[str, Any], retry_cfg: Dic
     path = os.path.join(parquet_root, "market", f"{alias}.parquet")
     _write_parquet(pl_df, path)
     logger.info(f"Wrote yfinance {symbol} as {alias} -> {path}")
+    return path
+
+
+@task
+def ingest_coingecko_asset(item: Dict[str, Any], cache: Dict[str, Any], retry_cfg: Dict[str, Any]):
+    logger = get_run_logger()
+    parquet_root = cache.get("parquet_root", "data/raw")
+    asset_id = item.get("id")
+    alias = item.get("alias") or asset_id
+
+    @_retry_decorator(retry_cfg)
+    def _fetch():
+        return _cg_prices(asset_id)
+
+    try:
+        prices = _fetch()
+    except Exception as e:
+        logger.warning(f"Skipping CoinGecko {asset_id}: {e}")
+        return ""
+    if not prices:
+        return ""
+    # prices: [ [ms, price], ... ]
+    pdf = pd.DataFrame(prices, columns=["ms", "value"])  # type: ignore
+    pdf["date"] = pd.to_datetime(pdf["ms"], unit="ms").dt.tz_localize(None)
+    pdf = pdf[["date", "value"]]
+    pl_df = pl.from_pandas(pdf)
+    path = os.path.join(parquet_root, "market", f"{alias}.parquet")
+    _write_parquet(pl_df, path)
+    logger.info(f"Wrote CoinGecko {asset_id} as {alias} -> {path}")
     return path
 
 
@@ -196,6 +284,41 @@ def ingest_yf(force: bool = False):
     return results
 
 
+@flow
+def ingest_alfred(force: bool = False):
+    load_dotenv()
+    cfg = load_sources_config()
+    retry_cfg = get_retry_config(cfg)
+    cache = get_cache_config(cfg)
+    ensure_dirs(cache)
+    vint_dir = os.path.join(cache.get("parquet_root", "data/raw"), "fred")
+    os.makedirs(os.path.join("data", "vintage", "fred"), exist_ok=True)
+
+    alfred_cfg = cfg.get("alfred", {})
+    api_key_env = alfred_cfg.get("api_key_env", "FRED_API_KEY")
+    series_list: List[Dict[str, Any]] = alfred_cfg.get("series", [])
+
+    results = []
+    for s in series_list:
+        s = {**s, "api_key_env": api_key_env}
+        results.append(ingest_alfred_series(s, cache, retry_cfg))
+    return results
+
+
+@flow
+def ingest_coingecko(force: bool = False):
+    cfg = load_sources_config()
+    retry_cfg = get_retry_config(cfg)
+    cache = get_cache_config(cfg)
+    ensure_dirs(cache)
+    cg_cfg = cfg.get("coingecko", {})
+    assets = cg_cfg.get("assets", [])
+    results = []
+    for it in assets:
+        results.append(ingest_coingecko_asset(it, cache, retry_cfg))
+    return results
+
+
 if __name__ == "__main__":
     # Run both flows for convenience
     ingest_fred()
@@ -205,3 +328,5 @@ def main():
     """Console entry point: run both FRED and yfinance ingests."""
     ingest_fred()
     ingest_yf()
+    ingest_alfred()
+    ingest_coingecko()

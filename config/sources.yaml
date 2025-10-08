@@ -18,6 +18,9 @@ fred:
     - { id: BAMLC0A0CM, name: IG OAS, freq: D, pillar: credit }
     - { id: TWEXB, name: USD Broad, freq: D, pillar: external }
     - { id: DCOILWTICO, name: WTI, freq: D, pillar: external }
+    - { id: DGS10, name: 10Y Treasury, freq: D, pillar: policy }
+    - { id: DGS3MO, name: 3M Treasury, freq: D, pillar: policy }
+    - { id: USREC, name: NBER Recession, freq: M, pillar: growth }
 
 yfinance:
   tickers:
@@ -28,3 +31,15 @@ yfinance:
 coingecko:
   assets:
     - { id: bitcoin, alias: BTC }
+
+treasury:
+  # Optional: if used, add endpoints for yield curve CSVs; not yet wired
+
+bea:
+  # Optional: NIPA API configuration (api_key_env: BEA_API_KEY)
+
+bls:
+  # Optional: series IDs for CPI/PPI/JOLTS (api_key_env: BLS_API_KEY)
+
+fed_h41:
+  # Optional: adapters for H.4.1 when configured

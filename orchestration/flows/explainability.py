@@ -90,13 +90,21 @@ def probit_marginal_effects():
             os.path.join(OUT_DIR, "explain_probit_effects.parquet")
         )
         return
-    # We didn't persist coefficients earlier; approximate with a simple re-fit here on monthly data if available.
-    # Reuse the build_regimes data join to reconstruct; otherwise, just publish the latest probability.
     rec = pl.read_parquet(fp).sort("date")
-    latest_p = float(rec.tail(1)["p_rec_12m"][0]) if rec.height else None
-    # minimal payload
+    latest = rec.tail(1)
+    latest_p = float(latest["p_rec_12m"][0]) if rec.height else None
+    latest_spread = float(latest["spread"][0]) if rec.height else None
+    coef_fp = os.path.join(OUT_DIR, "recession_probit_coefs.json")
+    coef = None
+    try:
+        import json
+        with open(coef_fp, "r") as f:
+            c = json.load(f)
+            coef = c
+    except Exception:
+        coef = None
     pl.DataFrame([
-        {"feature": "10y-3m spread", "value": None, "coef": None, "effect": latest_p}
+        {"feature": "10y-3m spread", "value": latest_spread, "coef": coef, "effect": latest_p}
     ]).write_parquet(os.path.join(OUT_DIR, "explain_probit_effects.parquet"))
 
 

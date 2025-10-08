@@ -9,7 +9,7 @@ help:
 	@echo "make build-indicators# indicators → data/indicators"
 	@echo "make build-pillars   # pillars → data/pillars"
 	@echo "make build-composite # composite + contributions → data/composite"
-	@echo "make pipeline        # ingest + all builds + explain + note"
+	@echo "make pipeline        # ingest + all builds + regimes + explain + note"
 	@echo "make explain         # generate explainability artifacts"
 	@echo "make monthly-note    # generate Monthly Macro Note (md)"
 	@echo "make api             # run FastAPI (reload)"
@@ -21,6 +21,7 @@ install:
 
 ingest:
 	poetry run python -m orchestration.flows.ingest_sources
+	poetry run python -c "from orchestration.flows.ingest_sources import ingest_coingecko; ingest_coingecko()"
 
 build-indicators:
 	poetry run python -m orchestration.flows.build_indicators
@@ -31,7 +32,7 @@ build-pillars:
 build-composite:
 	poetry run python -m orchestration.flows.build_composite
 
-pipeline: ingest build-indicators build-pillars build-composite explain monthly-note
+pipeline: ingest build-indicators build-pillars build-composite build-regimes explain monthly-note
 
 explain:
 	poetry run python -m orchestration.flows.explainability
@@ -39,9 +40,14 @@ explain:
 monthly-note:
 	poetry run python -m orchestration.flows.monthly_note
 
+build-regimes:
+	poetry run python -m orchestration.flows.build_regimes
 
 api:
 	poetry run uvicorn apps.api.main:app --reload --port 8000
 
 web:
 	cd apps/web && npm run dev
+
+alfred:
+	poetry run python -m orchestration.flows.ingest_sources ingest_alfred
