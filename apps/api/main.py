@@ -250,3 +250,75 @@ def contributions():
 @app.get("/meta/changelog")
 def changelog():
     return {"entries":[{"ts":datetime.utcnow().isoformat(),"kind":"source","version":"v0","message":"initial demo"}]}
+
+# Explainability + Monthly Note endpoints
+
+ART_DIR = "data/artifacts"
+
+
+@app.get("/explain/indicator-snapshot")
+def explain_indicator_snapshot(top_k: int = 12):
+    fp = os.path.join(ART_DIR, "explain_indicator_snapshot.parquet")
+    if not os.path.exists(fp):
+        return {"items": []}
+    df = pl.read_parquet(fp).sort(pl.col("composite_contrib_est").abs(), descending=True).head(top_k)
+    return {"items": df.to_dicts()}
+
+
+@app.get("/explain/pillar-contrib-timeseries")
+def explain_pillar_contrib_timeseries():
+    fp = os.path.join(ART_DIR, "explain_pillar_contrib_timeseries.parquet")
+    if not os.path.exists(fp):
+        return {"series": []}
+    df = pl.read_parquet(fp).sort(["pillar", "date"]) if os.path.getsize(fp) > 0 else pl.DataFrame()
+    if df.is_empty():
+        return {"series": []}
+    # ensure numeric and null-safe values
+    if "contribution" in df.columns:
+        df = df.with_columns(pl.col("contribution").cast(pl.Float64).fill_null(0.0))
+    # reshape: one series per pillar
+    series = []
+    for p in df.select("pillar").unique()["pillar"].to_list():
+        sub = df.filter(pl.col("pillar") == p).select(["date", "contribution"]).to_dicts()
+        points = []
+        for r in sub:
+            val = r.get("contribution")
+            points.append({"date": str(r.get("date")), "value": float(val) if val is not None else 0.0})
+        series.append({"pillar": p, "points": points})
+    return {"series": series}
+
+
+@app.get("/explain/probit-effects")
+def explain_probit_effects():
+    fp = os.path.join(ART_DIR, "explain_probit_effects.parquet")
+    if not os.path.exists(fp):
+        return {"items": []}
+    df = pl.read_parquet(fp)
+    return {"items": df.to_dicts()}
+
+
+@app.get("/note/monthly")
+def note_monthly():
+    fp = os.path.join(ART_DIR, "monthly_note.md")
+    if not os.path.exists(fp):
+        return {"markdown": "# Monthly Macro Note\n\n(Generate the note first.)"}
+    with open(fp, "r") as f:
+        md = f.read()
+    return {"markdown": md, "generated_at": os.path.getmtime(fp)}
+
+
+# Turning Points: track labels for regime bands
+@app.get("/turning-points/track")
+def turning_points_track(name: str = "business"):
+    base = os.path.join("data", "regimes")
+    fp = os.path.join(base, f"{name}.parquet")
+    if not os.path.exists(fp):
+        return {"labels": []}
+    try:
+        df = pl.read_parquet(fp)
+        if df.height == 0:
+            return {"labels": []}
+        rows = df.select(["date", "label"]).drop_nulls().to_dicts()
+        return {"labels": [{"date": str(r["date"]), "label": r["label"]} for r in rows]}
+    except Exception:
+        return {"labels": []}

@@ -9,7 +9,9 @@ help:
 	@echo "make build-indicators# indicators → data/indicators"
 	@echo "make build-pillars   # pillars → data/pillars"
 	@echo "make build-composite # composite + contributions → data/composite"
-	@echo "make pipeline        # ingest + all builds"
+	@echo "make pipeline        # ingest + all builds + explain + note"
+	@echo "make explain         # generate explainability artifacts"
+	@echo "make monthly-note    # generate Monthly Macro Note (md)"
 	@echo "make api             # run FastAPI (reload)"
 	@echo "make web             # run Next.js dev server"
 
@@ -29,7 +31,14 @@ build-pillars:
 build-composite:
 	poetry run python -m orchestration.flows.build_composite
 
-pipeline: ingest build-indicators build-pillars build-composite
+pipeline: ingest build-indicators build-pillars build-composite explain monthly-note
+
+explain:
+	poetry run python -m orchestration.flows.explainability
+
+monthly-note:
+	poetry run python -m orchestration.flows.monthly_note
+
 
 api:
 	poetry run uvicorn apps.api.main:app --reload --port 8000
