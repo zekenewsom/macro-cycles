@@ -1,4 +1,5 @@
 from fastapi import FastAPI, Query
+from fastapi.middleware.cors import CORSMiddleware
 from datetime import datetime, timedelta
 import duckdb, os, json
 import yaml
@@ -11,8 +12,20 @@ from apps.api.models import (
     HMMResponse,
     TransitionMatrixResponse,
 )
+from libs.py.vintage import asof_snapshot
 
 app = FastAPI(title="Macro Cycles Local API", version="0.1.0")
+
+# CORS for local Next.js dev server
+_origins = os.getenv("CORS_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000").split(",")
+origins = [o.strip() for o in _origins if o.strip()]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins or ["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 DB_PATH = os.getenv("DUCKDB_PATH", "db/catalog.duckdb")
 
 def connect():
@@ -45,32 +58,49 @@ def meta_with_warnings(extra: dict | None = None, warnings: List[str] | None = N
 def health():
     return {"status": "ok", "ts": datetime.utcnow().isoformat()}
 
+COMP_LIVE = os.path.join("data", "composite", "composite.parquet")
+COMP_ASOF_DIR = os.path.join("data", "composite_asof")
+
 @app.get("/overview/composite")
-def composite(window_years: int = 40, method: str = "weighted"):
+def composite(method: str = "weighted", asof: str | None = None, max_points: int = 2000):
     warnings: List[str] = []
-    fp = os.path.join("data", "composite", "composite.parquet")
+    # Backward-compatible: if no asof, return the richer live series shape (score, regime, confidence)
+    if not asof:
+        fp = COMP_LIVE
+        if not os.path.exists(fp):
+            warnings.append("Composite parquet not found; run build_composite.")
+            return {"series": [], "meta": meta_with_warnings(warnings=warnings)}
+        df = pl.read_parquet(fp).select(["date", "score", "z", "z_median", "z_trimmed_mean", "diffusion_composite", "regime", "confidence"]).drop_nulls(subset=["date"]).sort("date")
+        col = "z"
+        m = (method or "weighted").lower()
+        if m == "median" and "z_median" in df.columns:
+            col = "z_median"
+        elif m in ("trimmed", "trimmed_mean") and "z_trimmed_mean" in df.columns:
+            col = "z_trimmed_mean"
+        elif m == "diffusion" and "diffusion_composite" in df.columns:
+            col = "diffusion_composite"
+        series = []
+        for r in df.iter_rows(named=True):
+            series.append({
+                "date": str(r["date"]),
+                "score": float(r.get("score") or 0.0),
+                "z": float(r.get(col) or 0.0),
+                "regime": r.get("regime"),
+                "confidence": float(r.get("confidence") or 0.0),
+            })
+        return {"series": series, "meta": meta_with_warnings(extra={"method": method, "asof": "live"})}
+    # As-of path: minimal z-only series from composite_asof
+    fp = os.path.join(COMP_ASOF_DIR, f"composite_{method}.parquet")
     if not os.path.exists(fp):
-        warnings.append("Composite parquet not found under data/composite; run build_pipeline.")
+        warnings.append("As-of composite parquet not found; run build_composite_asof.")
         return {"series": [], "meta": meta_with_warnings(warnings=warnings)}
-    df = pl.read_parquet(fp).select(["date", "score", "z", "z_median", "z_trimmed_mean", "diffusion_composite", "regime", "confidence"]).drop_nulls(subset=["date"]).sort("date")
-    col = "z"
-    m = (method or "weighted").lower()
-    if m == "median" and "z_median" in df.columns:
-        col = "z_median"
-    elif m in ("trimmed", "trimmed_mean") and "z_trimmed_mean" in df.columns:
-        col = "z_trimmed_mean"
-    elif m == "diffusion" and "diffusion_composite" in df.columns:
-        col = "diffusion_composite"
-    series = []
-    for r in df.iter_rows(named=True):
-        series.append({
-            "date": str(r["date"]),
-            "score": float(r.get("score") or 0.0),
-            "z": float(r.get(col) or 0.0),
-            "regime": r.get("regime"),
-            "confidence": float(r.get("confidence") or 0.0),
-        })
-    return {"series": series, "meta": meta_with_warnings(warnings=warnings)}
+    df = pl.read_parquet(fp).select(["date", "z"]).drop_nulls(subset=["date"]).sort("date")
+    df = df.filter(pl.col("date") <= pl.lit(asof))
+    if df.height > max_points:
+        stride = max(1, df.height // max_points)
+        df = df.with_row_count().filter(pl.col("row_nr") % stride == 0).drop("row_nr")
+    series = [{"date": str(d), "z": float(z)} for d, z in zip(df["date"], df["z"]) ]
+    return {"series": series, "meta": meta_with_warnings(extra={"method": method, "asof": asof})}
 
 @app.get("/overview/pillars")
 def pillars():
@@ -461,6 +491,8 @@ def market_regime_transition_matrix(tickers: str = "SPX,UST2Y,UST10Y,TWEXB,GOLD,
 
 # Drivers/Data Browser endpoints
 DATA_DIR = "data"
+IND_DIR = os.path.join(DATA_DIR, "indicators")
+VINT_DIR = os.path.join(DATA_DIR, "vintages", "fred")
 
 @app.get("/drivers/pillars")
 def drivers_pillars():
@@ -681,39 +713,23 @@ def explain_probit_effects():
     return {"items": df.to_dicts()}
 
 
+RISK_DIR = os.path.join("data", "risk")
+
 @app.get("/risk/recession")
-def risk_recession(as_of: str | None = None):
-    """Surface recession probability from a probit model artifact if available.
-    Looks for a parquet with columns [date, prob] under data/artifacts/recession_probit.parquet.
-    If not available, returns null probability with warnings (no demo fallbacks).
-    """
-    warnings: List[str] = []
-    fp = os.path.join(ART_DIR, "recession_probit.parquet")
-    if not os.path.exists(fp):
-        warnings.append("No probit artifact found at data/artifacts/recession_probit.parquet")
-        return {"prob": None, "date": None, "meta": meta_with_warnings(warnings=warnings)}
+def risk_recession(asof: str | None = None, horizon_m: int = 12):
+    """Return recession probability using probit on 10y-3m spread (vintage-clean as-of)."""
+    coef_fp = os.path.join(RISK_DIR, f"probit_{horizon_m}m_coef.npy")
+    if not os.path.exists(coef_fp):
+        return {"asof": asof, "p": None, "meta": meta_with_warnings(warnings=["model not fit"]) }
     try:
-        df = pl.read_parquet(fp).select([c for c in ["date", "prob", "p_recession", "probability"] if c in pl.read_parquet(fp).columns])
-        # normalize column name to prob
-        if "prob" not in df.columns:
-            for c in ["p_recession", "probability"]:
-                if c in df.columns:
-                    df = df.rename({c: "prob"})
-                    break
-        df = df.drop_nulls(subset=["date"]).sort("date")
-        if as_of:
-            try:
-                df = df.filter(pl.col("date") <= pl.lit(as_of))
-            except Exception:
-                pass
-        if df.height == 0 or "prob" not in df.columns:
-            warnings.append("Probit artifact missing required columns")
-            return {"prob": None, "date": None, "meta": meta_with_warnings(warnings=warnings)}
-        row = df.tail(1)
-        return {"prob": float(row["prob"][0]), "date": str(row["date"][0]), "meta": meta_with_warnings()}
+        from orchestration.models.recession_probit import predict_asof
+        # if no asof provided, attempt using today's date (best-effort)
+        if not asof:
+            asof = datetime.utcnow().date().isoformat()
+        res = predict_asof.fn(asof, horizon_m)
+        return {**res, "meta": meta_with_warnings()}
     except Exception as e:
-        warnings.append(f"risk error: {type(e).__name__}")
-        return {"prob": None, "date": None, "meta": meta_with_warnings(warnings=warnings)}
+        return {"asof": asof, "p": None, "meta": meta_with_warnings(warnings=[f"risk error: {type(e).__name__}"]) }
 
 
 @app.get("/note/monthly")
@@ -728,17 +744,21 @@ def note_monthly():
 
 # Turning Points: track labels for regime bands
 @app.get("/turning-points/track")
-def turning_points_track(name: str = "business"):
+def turning_points_track(name: str = "business", method: str = "weighted"):
     base = os.path.join("data", "regimes")
-    fp = os.path.join(base, f"{name}.parquet")
+    fp = os.path.join(base, f"{name}_{method}_hmm.parquet") if name == "business" else os.path.join(base, f"{name}.parquet")
     if not os.path.exists(fp):
-        return {"labels": []}
+        # fallback to legacy if exists
+        alt = os.path.join(base, f"{name}.parquet")
+        if not os.path.exists(alt):
+            return {"labels": []}
+        fp = alt
     try:
         df = pl.read_parquet(fp)
         if df.height == 0:
             return {"labels": []}
-        rows = df.select(["date", "label"]).drop_nulls().to_dicts()
-        return {"labels": [{"date": str(r["date"]), "label": r["label"]} for r in rows]}
+        rows = df.select(["date", "label"]).drop_nulls().sort("date").to_dicts()
+        return {"labels": [{"date": str(r["date"]), "label": r["label"]} for r in rows], "meta": meta_with_warnings(extra={"name": name, "method": method})}
     except Exception:
         return {"labels": []}
 
@@ -796,13 +816,24 @@ def meta_dq():
                     flat_items.append(it)
         elif isinstance(doc, dict):
             flat_items.append(doc)
-    # surface warnings for stale (>45 days) or low rows
+    # surface warnings for stale (>45 days) or very low rows; be robust to missing values
     for it in flat_items:
         ident = it.get("series_id") or os.path.basename(it.get("path", "?"))
-        if (it.get("staleness_days") or 0) > 45:
-            warnings.append(f"{ident} stale {it.get('staleness_days')}d")
-        if (it.get("rows") or 0) < 10:
-            warnings.append(f"{ident} few rows: {it.get('rows')}")
+        # stale
+        try:
+            stale = int(it.get("staleness_days")) if it.get("staleness_days") is not None else None
+        except Exception:
+            stale = None
+        if stale is not None and stale > 45:
+            warnings.append(f"{ident} stale {stale}d")
+        # few rows
+        rows_val = it.get("rows")
+        try:
+            rows_n = int(rows_val) if rows_val is not None else None
+        except Exception:
+            rows_n = None
+        if rows_n is not None and rows_n < 10:
+            warnings.append(f"{ident} few rows: {rows_n}")
     return {"items": flat_items, "meta": meta_with_warnings(warnings=list(set(warnings)))}
 
 # Data Browser endpoints
@@ -857,34 +888,63 @@ def data_catalog():
 
 
 @app.get("/data/series")
-def data_series(series_id: str, include_z: bool = True, vintage: str | None = None):
-    base = os.path.join(DATA_DIR, "indicators")
-    path = os.path.join(base, f"{series_id}.parquet")
-    if not os.path.exists(path):
+def data_series(
+    series_id: str,
+    field: str = "z",
+    start: str | None = None,
+    end: str | None = None,
+    downsample: int = 1500,
+    asof: str | None = None,
+    vintage: str | None = None,  # backward-compat alias for asof
+    include_z: bool = True,      # backward-compat control
+):
+    """Return a series either from indicators (field=z/value) or as-of vintages.
+    If 'asof' is provided and vintages exist under data/vintages/fred/{series_id}.parquet,
+    serve the as-published values (value only). Otherwise serve indicator field.
+    """
+    # Vintage path
+    if (vintage and not asof):
+        asof = vintage
+    vint_fp = os.path.join(VINT_DIR, f"{series_id}.parquet")
+    if asof and os.path.exists(vint_fp):
+        df = pl.read_parquet(vint_fp)
+        df = asof_snapshot(df, asof)
+        if start:
+            df = df.filter(pl.col("date") >= pl.lit(start))
+        if end:
+            df = df.filter(pl.col("date") <= pl.lit(end))
+        n = df.height
+        if n > downsample and downsample > 0:
+            stride = max(1, n // downsample)
+            df = df.with_row_count().filter(pl.col("row_nr") % stride == 0).drop("row_nr")
+        return {
+            "series": [{"date": str(d), "value": float(v)} for d, v in zip(df["date"], df["value"])],
+            "meta": meta_with_warnings(extra={"series_id": series_id, "mode": "vintage", "asof": asof, "points": df.height}),
+        }
+    # Indicator path
+    fp = os.path.join(IND_DIR, f"{series_id}.parquet")
+    if not os.path.exists(fp):
         return {"series": [], "meta": meta_with_warnings(warnings=[f"No indicators parquet for {series_id}"])}
-    df = pl.read_parquet(path)
-    cols = ["date", "value"] + (["z"] if include_z and "z" in df.columns and not vintage else [])
-    df = df.select([c for c in cols if c in df.columns]).sort("date")
-    # Optional vintage-as-of selection (using ALFRED vintages if available)
-    if vintage:
-        try:
-            vdt = pl.datetime.strptime(vintage, "%Y-%m-%d")
-        except Exception:
-            vdt = None
-        vint_path = os.path.join(DATA_DIR, "vintage", "fred", f"{series_id}.parquet")
-        if vdt and os.path.exists(vint_path):
-            vint = pl.read_parquet(vint_path).select(["date", "value", "vintage"]).filter(pl.col("vintage") <= vdt).sort(["date", "vintage"])  # type: ignore
-            vint_asof = vint.group_by("date").agg(pl.col("value").last()).rename({"value": "value_vint"})
-            df = df.join(vint_asof, on="date", how="left").with_columns(pl.coalesce([pl.col("value_vint"), pl.col("value")]).alias("value")).drop("value_vint")
-            # If vintage-as-of is used, z from latest is not appropriate; omit z
-            if "z" in df.columns:
-                df = df.drop("z")
-    out = [{"date": str(r[0]), "value": (float(r[1]) if r[1] is not None else None), **({"z": (float(r[2]) if len(r) > 2 and r[2] is not None else None)} if len(cols) > 2 else {})} for r in df.iter_rows()]
+    base = pl.read_parquet(fp)
+    # honor previous include_z flag if field isn't explicitly set
+    fallback_field = "z" if include_z and ("z" in base.columns) else ("value" if "value" in base.columns else "z")
+    use_field = field if field in base.columns else fallback_field
+    df = base.select(["date", use_field]).rename({use_field: "value"}).drop_nulls().sort("date")
+    if start:
+        df = df.filter(pl.col("date") >= pl.lit(start))
+    if end:
+        df = df.filter(pl.col("date") <= pl.lit(end))
+    n = df.height
+    if n > downsample and downsample > 0:
+        stride = max(1, n // downsample)
+        df = df.with_row_count().filter(pl.col("row_nr") % stride == 0).drop("row_nr")
     # attach basic metadata
-    meta_row = pl.read_parquet(path, n_rows=1)
-    label = meta_row.get_column("label").to_list()[0] if "label" in meta_row.columns and meta_row.height else series_id
-    pillar = meta_row.get_column("pillar").to_list()[0] if "pillar" in meta_row.columns and meta_row.height else None
-    return {"series": out, "meta": meta_with_warnings(extra={"series_id": series_id, "label": label, "pillar": pillar, "vintage": vintage})}
+    label = base.get_column("label").to_list()[0] if "label" in base.columns and base.height else series_id
+    pillar = base.get_column("pillar").to_list()[0] if "pillar" in base.columns and base.height else None
+    return {
+        "series": [{"date": str(d), "value": float(v)} for d, v in zip(df["date"], df["value"])],
+        "meta": meta_with_warnings(extra={"series_id": series_id, "label": label, "pillar": pillar, "field": use_field, "points": df.height}),
+    }
 
 
 @app.get("/drivers/pillar-indicator-contrib")
@@ -990,3 +1050,139 @@ def market_price_series(ticker: str, start: str | None = None, end: str | None =
         df = df.with_row_count().filter(pl.col("row_nr") % stride == 0).drop("row_nr")
     series = [{"date": str(d), "value": float(v)} for d, v in zip(df["date"].to_list(), df["value"].to_list())]
     return {"series": series, "meta": {"ticker": sid, "points": df.height}}
+
+
+@app.get("/backtest/spx_v0")
+def backtest_spx_v0():
+    fp = os.path.join("data", "backtests", "spx_signal_v0.parquet")
+    mp = os.path.join("data", "backtests", "spx_signal_v0_metrics.parquet")
+    if not os.path.exists(fp):
+        return {"series": [], "metrics": {}, "meta": meta_with_warnings(warnings=["No backtest artifact found"]) }
+    df = pl.read_parquet(fp).sort("date")
+    ser = [
+      {"date": str(d), "ret": (float(r) if r is not None else 0.0), "ret_sig": (float(s) if s is not None else 0.0)}
+      for d, r, s in zip(df["date"], df.get_column("ret"), df.get_column("ret_sig"))
+    ]
+    metrics = pl.read_parquet(mp).to_dicts()[0] if os.path.exists(mp) else {}
+    return {"series": ser, "metrics": metrics, "meta": meta_with_warnings()}
+
+
+@app.get("/backtest/composite-threshold")
+def backtest_composite_threshold(ticker: str = "SPX", method: str = "weighted", cost_bps: float = 10.0):
+    mkt_fp = os.path.join("data", "raw", "market", f"{ticker}.parquet")
+    if not os.path.exists(mkt_fp):
+        return {"series": [], "metrics": {}, "meta": meta_with_warnings(warnings=["no market parquet"]) }
+    px = pl.read_parquet(mkt_fp).select(["date", "value"]).drop_nulls().sort("date")
+    # Monthly end-of-month sampling without duplicating the 'date' column
+    mpx = (
+        px.group_by_dynamic("date", every="1mo", period="1mo", closed="left", label="right")
+          .agg(pl.col("value").last().alias("close"))
+          .drop_nulls(subset=["date"])  # ensure date present
+          .sort("date")
+    )
+    mpx = mpx.with_columns([
+        pl.col("date").cast(pl.Date),  # align join key dtype to composite_asof (Date)
+        pl.col("close").pct_change().alias("ret"),
+    ])
+    warnings: list[str] = []
+    comp_fp = os.path.join("data", "composite_asof", f"composite_{method}.parquet")
+    comp: pl.DataFrame | None = None
+    if os.path.exists(comp_fp):
+        try:
+            comp = pl.read_parquet(comp_fp).drop_nulls(subset=["date"]).with_columns(pl.col("date").cast(pl.Date)).sort("date")
+        except Exception:
+            comp = None
+    if comp is None or comp.is_empty() or ("z" in comp.columns and comp["z"].drop_nulls().is_empty()):
+        # Fallback to live composite if as-of artifact is missing/empty
+        live_fp = os.path.join("data", "composite", "composite.parquet")
+        if os.path.exists(live_fp):
+            df = pl.read_parquet(live_fp).drop_nulls(subset=["date"]).with_columns(pl.col("date").cast(pl.Date)).sort("date")
+            col = "z"
+            m = (method or "weighted").lower()
+            if m == "median" and "z_median" in df.columns:
+                col = "z_median"
+            elif m in ("trimmed", "trimmed_mean") and "z_trimmed_mean" in df.columns:
+                col = "z_trimmed_mean"
+            elif m == "diffusion" and "diffusion_composite" in df.columns:
+                col = "diffusion_composite"
+            comp = df.select(["date", col]).rename({col: "z"}).drop_nulls(subset=["z"]).sort("date")
+            warnings.append("fallback to live composite; as-of artifact missing or empty")
+        else:
+            return {"series": [], "metrics": {}, "meta": meta_with_warnings(warnings=["no composite artifacts found"]) }
+    # Debug meta for overlap diagnostics
+    price_min = str(mpx["date"].min()) if mpx.height else None
+    price_max = str(mpx["date"].max()) if mpx.height else None
+    comp_min = str(comp["date"].min()) if comp.height else None
+    comp_max = str(comp["date"].max()) if comp.height else None
+    df = mpx.join(comp, on="date", how="inner").sort("date")
+    df = df.with_columns([(pl.col("z") > 0).cast(pl.Int8).alias("sig")])
+    df = df.with_columns(pl.col("sig").shift(1).fill_null(0).alias("sig_lag"))
+    df = df.with_columns((pl.col("sig_lag") != pl.col("sig_lag").shift(1)).cast(pl.Int8).fill_null(0).alias("_chg"))
+    tc = cost_bps / 10000.0
+    df = df.with_columns((pl.col("ret").fill_nan(0) * pl.col("sig_lag") - pl.col("_chg") * tc).alias("ret_sig"))
+    import numpy as np, math
+    retn = df["ret"].fill_nan(0).fill_null(0).to_numpy()
+    rets = df["ret_sig"].fill_nan(0).fill_null(0).to_numpy()
+    eq_bh = np.cumprod(1 + retn) if retn.size else np.array([1.0])
+    eq_sig = np.cumprod(1 + rets) if rets.size else np.array([1.0])
+    def sharpe(x):
+        x = np.array(x)
+        if x.size == 0:
+            return 0.0
+        m = float(np.mean(x))
+        s = float(np.std(x))
+        return float(m / (s + 1e-12) * np.sqrt(12))
+    def maxdd(x):
+        x = np.array(x)
+        peak = np.maximum.accumulate(x)
+        dd = (x - peak) / peak
+        return float(np.min(dd))
+    n_months = int(df.height)
+    # turnover: fraction of months with a signal change
+    try:
+        chg_count = int(df["_chg"].fill_null(0).sum()) if n_months > 0 else 0
+    except Exception:
+        chg_count = 0
+    turnover_m = (chg_count / n_months) if n_months > 0 else 0.0
+    met = {
+        "n_months": n_months,
+        "bh_cagr": float(eq_bh[-1] ** (12 / n_months) - 1) if n_months > 0 else 0.0,
+        "strat_cagr": float(eq_sig[-1] ** (12 / n_months) - 1) if n_months > 0 else 0.0,
+        "bh_sharpe": sharpe(df["ret"].fill_null(0)),
+        "strat_sharpe": sharpe(df["ret_sig"].fill_null(0)),
+        "strat_maxdd": maxdd(eq_sig) if n_months > 0 else 0.0,
+        "turnover_m": float(turnover_m),
+    }
+    def sfloat(v: float | None) -> float:
+        try:
+            if v is None:
+                return 0.0
+            fv = float(v)
+            if math.isnan(fv) or math.isinf(fv):
+                return 0.0
+            return fv
+        except Exception:
+            return 0.0
+    ser = [
+        {"date": str(d), "ret": sfloat(r), "ret_sig": sfloat(s)}
+        for d, r, s in zip(df["date"], df["ret"], df["ret_sig"])
+    ]
+    return {
+        "series": ser,
+        "metrics": met,
+        "meta": meta_with_warnings(
+            extra={
+                "ticker": ticker,
+                "method": method,
+                "cost_bps": cost_bps,
+                "n_price": int(mpx.height),
+                "n_comp": int(comp.height),
+                "n_join": int(df.height),
+                "price_min": price_min,
+                "price_max": price_max,
+                "comp_min": comp_min,
+                "comp_max": comp_max,
+            },
+            warnings=warnings,
+        ),
+    }

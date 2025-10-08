@@ -6,7 +6,7 @@ fred:
   api_key_env: FRED_API_KEY
   series:
     - { id: NAPMNOI, name: ISM New Orders Index, freq: M, pillar: growth }
-    - { id: INDPRO, name: Industrial Production, freq: M, pillar: growth }
+    - { id: INDPRO, name: Industrial Production, freq: M, pillar: growth, vintage: true }
     - { id: RSAFS, name: Real Retail Sales, freq: M, pillar: growth }
     - { id: PERMIT, name: Building Permits, freq: M, pillar: housing }
     - { id: ICSA, name: Initial Claims, freq: W, pillar: labor }
@@ -20,7 +20,8 @@ fred:
     - { id: DCOILWTICO, name: WTI, freq: D, pillar: external }
     - { id: DGS10, name: 10Y Treasury, freq: D, pillar: policy }
     - { id: DGS3MO, name: 3M Treasury, freq: D, pillar: policy }
-    - { id: USREC, name: NBER Recession, freq: M, pillar: growth }
+    - { id: T10Y3M, name: 10y-3m Term Spread, freq: D, pillar: policy, vintage: true }
+    - { id: USREC, name: NBER Recession, freq: M, pillar: growth, vintage: true }
 
 yfinance:
   tickers:

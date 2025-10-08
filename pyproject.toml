@@ -26,7 +26,8 @@ dependencies = [
     "hmmlearn (>=0.3.3,<0.4.0)",
     "statsmodels (>=0.14.5,<0.15.0)",
     "scikit-learn (>=1.7.2,<2.0.0)",
-    "PyYAML (>=6.0.0,<7.0.0)"
+    "PyYAML (>=6.0.0,<7.0.0)",
+    "pandas-market-calendars (>=5.1.1,<6.0.0)"
 ]
 
 
